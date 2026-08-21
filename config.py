@@ -18,6 +18,9 @@ class Config:
     server_context: int = 32768
     context_limit: int = 26000
     max_tool_rounds: int = 50
+    # Plans and summaries share this budget with the model's reasoning, so 512
+    # leaves too little for the text itself and the plan gets cut mid-sentence.
+    plan_tokens: int = 1536
 
     temperature: float = 0.6
     action_temperature: float = 0.1

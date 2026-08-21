@@ -1,4 +1,4 @@
-import json
+﻿import json
 import inspect
 import re
 import sys
@@ -95,6 +95,14 @@ def _strip_xml_toolcalls(text: str) -> str:
     text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
     text = re.sub(r"<function>.*?</function>", "", text, flags=re.DOTALL)
     text = re.sub(r"<invoke>.*?</invoke>", "", text, flags=re.DOTALL)
+    # A cut-off generation leaves orphan closing tags ("</parameter>
+    # </function> </tool_call>") that are not part of any pair. Left alone they
+    # are printed as if the model had answered, and stored as real content.
+    text = re.sub(
+        r"</?(?:tool_call|function|invoke|parameter|parameters|arguments)\b[^>]*>",
+        "",
+        text,
+    )
     return text.strip()
 
 
@@ -441,7 +449,7 @@ class TinyCodeAgent:
             normalized.append({"role": "user", "content": "Continue."})
         return normalized
 
-    def _call_llm(self, spinner_message="Thinking", silent=False, force_prompt=None, max_tokens=None, use_tools=True):
+    def _call_llm(self, spinner_message="Thinking", silent=False, force_prompt=None, max_tokens=None, use_tools=True, no_thinking=False):
         kwargs = {
             "model": self.config.model_name,
             "messages": self._normalize_messages(
@@ -452,6 +460,13 @@ class TinyCodeAgent:
             "stream": True,
             "timeout": 90,
         }
+
+        if no_thinking:
+            # A reasoning model can burn the whole budget and return nothing.
+            # The per-request `reasoning_budget` field is ignored by llama.cpp,
+            # but the chat template switch does work, so use that to force an
+            # answer out on the retry instead of wasting another round.
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
         if use_tools:
             kwargs["tools"] = self.tool_schemas
@@ -735,6 +750,24 @@ class TinyCodeAgent:
                     print("\n  [model did not respond, stopping]\n")
                     return
 
+            # A reasoning model can spend the whole budget thinking and return
+            # nothing usable. Salvage the round by retrying with thinking off
+            # (llama.cpp ignores per-request reasoning_budget, but the chat
+            # template switch works), instead of spending a round on a plea.
+            if not msg.get("tool_calls") and not msg.get("content"):
+                print(f"  [{rnd+1}/{max_rounds}] (empty reply, retrying without thinking)")
+                retry = self._call_llm(
+                    silent=silent,
+                    use_tools=not is_last,
+                    no_thinking=True,
+                    force_prompt=(
+                        "Your previous response was empty. "
+                        "Output the next tool call now, without thinking."
+                    ),
+                )
+                if retry is not None and (retry.get("tool_calls") or retry.get("content")):
+                    msg = retry
+
             tc_list = msg.get("tool_calls")
             content = msg.get("content", "")
 
@@ -837,17 +870,9 @@ class TinyCodeAgent:
                     ),
                 })
             else:
+                # The no-thinking retry above already failed for this round.
                 reasoning_rounds += 1
-                if reasoning_rounds <= 2:
-                    print(f"  [{rnd+1}/{max_rounds}] (reasoning overflow, forcing continue)")
-                    self._add_msg({
-                        "role": "user",
-                        "content": (
-                            "Your previous response was empty (reasoning consumed all tokens). "
-                            "Stop thinking and output the next tool call or answer directly."
-                        )
-                    })
-                else:
+                if reasoning_rounds > 2:
                     print("\n  [model stuck in reasoning loop, stopping]\n")
                     return
 
@@ -867,14 +892,29 @@ class TinyCodeAgent:
     def _process_plan_turn(self):
         print("  [analyzing and creating plan...]")
         for rnd in range(3):
-            msg = self._call_llm(silent=True, max_tokens=512)
+            msg = self._call_llm(silent=True, max_tokens=self.config.plan_tokens)
             if msg is None:
-                msg = self._call_llm(silent=True, force_prompt="Output your plan now. No more analysis needed.", max_tokens=512)
+                msg = self._call_llm(silent=True, force_prompt="Output your plan now. No more analysis needed.", max_tokens=self.config.plan_tokens)
                 if msg is None:
                     print("  [model did not respond]\n")
                     return
 
             tc_list = msg.get("tool_calls")
+            if not tc_list and not (msg.get("content") or "").strip():
+                # Reasoning ate the whole reply. Retry with thinking off rather
+                # than accepting an empty string as a finished plan.
+                retry = self._call_llm(
+                    silent=True,
+                    max_tokens=self.config.plan_tokens,
+                    no_thinking=True,
+                    force_prompt="Output your numbered plan now. Do not think, just write it.",
+                )
+                if retry is not None and (retry.get("content") or "").strip():
+                    msg = retry
+                    tc_list = msg.get("tool_calls")
+                else:
+                    continue
+
             if not tc_list:
                 plan = msg.get("content", "")
                 plan = _strip_xml_toolcalls(plan)
@@ -908,10 +948,18 @@ class TinyCodeAgent:
                     print(f"  !!! {result}")
                 self._add_msg({"role": "tool", "tool_call_id": tc["id"], "content": result})
 
-        msg = self._call_llm(silent=True, force_prompt="Stop using tools. Output your numbered plan now.", max_tokens=512)
-        if msg:
-            plan = msg.get("content", "")
-            plan = _strip_xml_toolcalls(plan)
+        msg = self._call_llm(silent=True, force_prompt="Stop using tools. Output your numbered plan now.", max_tokens=self.config.plan_tokens)
+        plan = _strip_xml_toolcalls((msg or {}).get("content", "") or "")
+        if not plan.strip():
+            msg = self._call_llm(
+                silent=True,
+                max_tokens=self.config.plan_tokens,
+                no_thinking=True,
+                force_prompt="Stop using tools. Write your numbered plan now, without thinking.",
+            )
+            plan = _strip_xml_toolcalls((msg or {}).get("content", "") or "")
+
+        if plan.strip():
             self._last_plan = plan
             print("\n" + "=" * 50)
             print("  PLAN")
@@ -922,6 +970,7 @@ class TinyCodeAgent:
             plan_path = PLANS_DIR / f"plan_{int(time.time())}.md"
             plan_path.write_text(plan, encoding="utf-8")
         else:
+            self._last_plan = ""
             print("  [model did not create a plan]\n")
 
     def _compact_messages(self):
@@ -965,7 +1014,7 @@ class TinyCodeAgent:
                 print("  [no saved sessions]\n")
             else:
                 print(f"\n  {'Name':<20} {'Model':<30} {'Msgs':<6} {'Time'}")
-                print(f"  {'─'*60}")
+                print(f"  {'в”Ђ'*60}")
                 for s in sessions:
                     print(f"  {s['name']:<20} {s['model']:<30} {s['messages']:<6} {s['time']}")
                 print()
@@ -1112,6 +1161,11 @@ class TinyCodeAgent:
                 print("\n  [interrupted, session kept]\n")
 
     def _handle_plan_approval(self):
+        if not (self._last_plan or "").strip():
+            print("  [no plan to approve - try /plan again]\n")
+            self.plan_mode = False
+            return
+
         print("\n  [Plan ready. Approve and execute? (y/n/edit)] ", end="", flush=True)
         try:
             resp = input().strip().lower()
@@ -1159,7 +1213,7 @@ def _count_plan_steps(plan: str) -> int:
             continue
         if line[0].isdigit() and len(line) > 1 and line[1] in ". ):-":
             count += 1
-        elif line.startswith(("-", "*", "•")):
+        elif line.startswith(("-", "*", "вЂў")):
             count += 1
     return count
 
@@ -1185,7 +1239,7 @@ def main():
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    parser = argparse.ArgumentParser(description="tiny-code — lightweight local AI coding agent")
+    parser = argparse.ArgumentParser(description="tiny-code вЂ” lightweight local AI coding agent")
     parser.add_argument("prompt", nargs="*", help="Optional prompt to run directly")
     parser.add_argument("--model", help="Override model name")
     parser.add_argument("--workspace", help="Workspace directory")

@@ -41,10 +41,10 @@ def run_bash(command: str, timeout: int = 30) -> str:
             if hint:
                 return f"Error: {hint}\n{PS_HELP}"
 
-            if _is_powershell_command(command):
-                shell_cmd = ["powershell", "-NoProfile", "-Command", command]
-            else:
-                shell_cmd = ["cmd", "/c", command]
+            # PowerShell is the documented shell for this agent, and cmd.exe
+            # mangles nested quotes: `python -c "import x"` reaches Python as
+            # a broken string literal. Route everything through PowerShell.
+            shell_cmd = ["powershell", "-NoProfile", "-Command", command]
         else:
             shell_cmd = ["sh", "-c", command]
 
@@ -130,11 +130,3 @@ def _sanitize_cmd(command: str) -> str:
     cmd = re.sub(r"\s+2>&1\s*\|\s*cat\b", "", cmd)
     cmd = re.sub(r"[ \t]{2,}", " ", cmd).strip().strip(";").strip()
     return cmd
-
-
-def _is_powershell_command(cmd: str) -> bool:
-    ps_indicators = [
-        "|", "Select-Object", "Where-Object", "ForEach-Object",
-        "Get-", "Set-", "-Recurse", "-Filter", "Write-",
-    ]
-    return any(indicator in cmd for indicator in ps_indicators)
