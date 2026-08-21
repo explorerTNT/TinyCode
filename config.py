@@ -6,7 +6,10 @@ from pathlib import Path
 class Config:
     lmstudio_host: str = "127.0.0.1"
     lmstudio_port: int = 8080
-    model_name: str = r"C:\Users\danii\.lmstudio\models\unsloth\Qwen3.5-2B-Q5_K_M.gguf"
+    # llama.cpp ignores this field (the model is chosen when the server starts),
+    # so a plain label works. Override with TINY_CODE_MODEL when the backend
+    # does care, e.g. LM Studio or any multi-model gateway.
+    model_name: str = "qwen3.5-2b"
 
     # The server runs with -c 32768. The prompt must leave room for the reply
     # (max_tokens) plus chat-template overhead, otherwise llama.cpp rejects the
