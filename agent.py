@@ -1,4 +1,4 @@
-﻿import json
+import json
 import inspect
 import re
 import sys
@@ -1014,7 +1014,7 @@ class TinyCodeAgent:
                 print("  [no saved sessions]\n")
             else:
                 print(f"\n  {'Name':<20} {'Model':<30} {'Msgs':<6} {'Time'}")
-                print(f"  {'в”Ђ'*60}")
+                print(f"  {'─'*60}")
                 for s in sessions:
                     print(f"  {s['name']:<20} {s['model']:<30} {s['messages']:<6} {s['time']}")
                 print()
@@ -1213,7 +1213,7 @@ def _count_plan_steps(plan: str) -> int:
             continue
         if line[0].isdigit() and len(line) > 1 and line[1] in ". ):-":
             count += 1
-        elif line.startswith(("-", "*", "вЂў")):
+        elif line.startswith(("-", "*", "•")):
             count += 1
     return count
 
@@ -1239,7 +1239,7 @@ def main():
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    parser = argparse.ArgumentParser(description="tiny-code вЂ” lightweight local AI coding agent")
+    parser = argparse.ArgumentParser(description="tiny-code — lightweight local AI coding agent")
     parser.add_argument("prompt", nargs="*", help="Optional prompt to run directly")
     parser.add_argument("--model", help="Override model name")
     parser.add_argument("--workspace", help="Workspace directory")
