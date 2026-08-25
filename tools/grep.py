@@ -27,22 +27,7 @@ def search_files(pattern: str, path: str = ".", include: str = None) -> str:
         if result_rg is not None:
             return result_rg
 
-        cmd = ["rtk", "grep", pattern, str(search_path)]
-        if include:
-            cmd.extend(["--include", include])
-
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=30,
-        )
-        output = result.stdout.rstrip() if result.stdout else ""
-        err = result.stderr.rstrip() if result.stderr else ""
-
-        if output:
-            return output
-        if err and "Error" in err:
-            return err
-        return f"No matches found for pattern '{pattern}' in {path}"
+        return _fallback_grep(pattern, path, include)
     except subprocess.TimeoutExpired:
         return f"Error: Search timed out after 30 seconds"
     except FileNotFoundError:

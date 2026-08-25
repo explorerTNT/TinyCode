@@ -105,15 +105,15 @@ def print_summary(results: list, total_elapsed: float):
         print(f"Avg task time: {avg_time:.2f}s")
         print(f"Avg token rate: {avg_rate:.2f} tok/s")
 
-    print(f"\n{'в”Ђ'*60}")
+    print(f"\n{'─'*60}")
     print(f"{'Task':<20} {'Status':<10} {'Time':<10} {'Tokens/s':<10}")
-    print(f"{'в”Ђ'*60}")
+    print(f"{'─'*60}")
     for r in results:
         status = r["status"]
         t = f"{r['elapsed_s']:.2f}s"
         rate = f"{r.get('token_rate', 0):.1f}" if status == "ok" else "-"
         print(f"{r['task']:<20} {status:<10} {t:<10} {rate:<10}")
-    print(f"{'в”Ђ'*60}")
+    print(f"{'─'*60}")
 
 
 def main():
