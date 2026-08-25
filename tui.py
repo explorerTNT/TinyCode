@@ -9,11 +9,14 @@ status updates (carriage-return lines) drive the side panel, and blocked
 """
 from __future__ import annotations
 
+import asyncio
 import builtins
 import io
 import os
 import queue
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -105,6 +108,7 @@ class TinyCodeTUI(App):
         self._orig_input = None
         self.agent = None
         self._last_ctrl_c = 0.0
+        self._loop = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -135,10 +139,35 @@ class TinyCodeTUI(App):
         self._orig_input = builtins.input
         sys.stdout = TUIWriter(self)
         builtins.input = self._tui_input
-        self.run_worker(self._run_agent, thread=True, group="agent")
+        self._loop = asyncio.get_running_loop()
+        self._install_sigint()
+        threading.Thread(target=self._run_agent, daemon=True).start()
 
     def on_unmount(self) -> None:
         self._restore()
+        if self._loop is not None:
+            try:
+                self._loop.remove_signal_handler(signal.SIGINT)
+            except Exception:
+                pass
+
+    def _install_sigint(self) -> None:
+        if self._loop is None:
+            return
+        try:
+            self._loop.add_signal_handler(signal.SIGINT, self._on_sigint)
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                signal.signal(
+                    signal.SIGINT,
+                    lambda s, f: self._loop.call_soon_threadsafe(self._on_sigint),
+                )
+            except Exception:
+                pass
+
+    def _on_sigint(self) -> None:
+        # Ctrl+C arrives as SIGINT, not as a key event, so we handle it here.
+        self._handle_ctrl_c()
 
     def action_refresh_files(self) -> None:
         self._build_tree()
@@ -154,9 +183,8 @@ class TinyCodeTUI(App):
                 if agent is not None:
                     agent.abort()
                     self.append_line(Text("[Esc] генерация остановлена — введите новый запрос или продолжите."))
-        elif event.key == "ctrl+c":
-            event.prevent_default()
-            self._handle_ctrl_c()
+        # Ctrl+C is delivered as SIGINT by the terminal, not as a key event,
+        # so it is handled in _on_sigint (see _install_sigint).
 
     def _handle_ctrl_c(self) -> None:
         try:
@@ -250,6 +278,8 @@ class TinyCodeTUI(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
+        if value:
+            self.append_line(Text(f">>> {value}", style="bold cyan"))
         inp = self.query_one("#input", Input)
         inp.value = ""
         inp.disabled = True

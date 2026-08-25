@@ -336,6 +336,7 @@ HELP_TEXT = """
 Commands:
   /session              Session save/load/resume management
   /clear                Clear conversation, start fresh
+  /new                  Start a new session (clear context)
   /plan [desc]          Enter plan mode (analyze first, then act)
   /compact              Summarize and shrink context
   /exit                 End session
@@ -1290,6 +1291,21 @@ class TinyCodeAgent:
             print("  [context cleared, fresh start]\n")
             return True
 
+        elif c == "/new":
+            try:
+                self.sessions.save(
+                    f"session_{int(time.time())}", self.messages,
+                    self.plan_mode, self.config.model_name, str(self.config.workspace),
+                )
+            except Exception:
+                pass
+            self._clear_messages()
+            self._add_msg({"role": "system", "content": SYSTEM_PROMPT})
+            self.plan_mode = False
+            self._last_plan = ""
+            print("  [new session — previous saved, context cleared]\n")
+            return True
+
         elif c.startswith("/plan"):
             self.plan_mode = True
             desc = c[5:].strip()
@@ -1353,6 +1369,10 @@ class TinyCodeAgent:
                 if self.plan_mode and user_input.startswith("/plan"):
                     self._process_plan_turn()
                     self._handle_plan_approval()
+                continue
+
+            if user_input.startswith("/"):
+                print(f"  [неизвестная команда: {user_input} — введите /help]")
                 continue
 
             try:
