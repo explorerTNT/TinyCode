@@ -1432,6 +1432,16 @@ def main():
     if args.permission:
         config.permission_mode = args.permission
 
+    if not args.prompt:
+        try:
+            import textual  # noqa: F401
+            from tui import run_tui
+        except ImportError:
+            pass
+        else:
+            run_tui(config)
+            return
+
     agent = TinyCodeAgent(config)
 
     if args.resume:
