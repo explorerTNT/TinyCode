@@ -14,6 +14,7 @@ import io
 import os
 import queue
 import sys
+import time
 from pathlib import Path
 
 from rich.syntax import Syntax
@@ -102,6 +103,8 @@ class TinyCodeTUI(App):
         self._input_q: "queue.Queue[str]" = queue.Queue()
         self._orig_stdout = None
         self._orig_input = None
+        self.agent = None
+        self._last_ctrl_c = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -114,7 +117,7 @@ class TinyCodeTUI(App):
             ),
             id="body",
         )
-        yield Input(id="input", placeholder="Спросите агента…  (Enter — отправить, /help, /plan, /clear, /exit)")
+        yield Input(id="input", placeholder="Спросите агента…  Enter — отправить · Esc — остановить модель · Ctrl+C — копировать выделение (×2 — выход)")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -139,6 +142,46 @@ class TinyCodeTUI(App):
 
     def action_refresh_files(self) -> None:
         self._build_tree()
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            event.prevent_default()
+            # Abort only while the agent is busy (input disabled). While the
+            # user is typing, Esc does nothing special.
+            inp = self.query_one("#input", Input)
+            if inp.disabled:
+                agent = getattr(self, "agent", None)
+                if agent is not None:
+                    agent.abort()
+                    self.append_line(Text("[Esc] генерация остановлена — введите новый запрос или продолжите."))
+        elif event.key == "ctrl+c":
+            event.prevent_default()
+            self._handle_ctrl_c()
+
+    def _handle_ctrl_c(self) -> None:
+        try:
+            log = self.query_one("#log", RichLog)
+            sel_obj = log.text_selection
+            if sel_obj is None:
+                sel = ""
+            else:
+                got = log.get_selection(sel_obj)
+                sel = (got[0] if got else "").strip()
+        except Exception:
+            sel = ""
+        if sel:
+            try:
+                self.copy_to_clipboard(sel)
+                self.append_line(Text(f"[Ctrl+C] скопировано в буфер: {len(sel)} симв."))
+            except Exception:
+                self.append_line(Text("[Ctrl+C] буфер недоступен, не удалось скопировать."))
+            return
+        now = time.monotonic()
+        if now - self._last_ctrl_c < 1.5:
+            self.exit()
+        else:
+            self._last_ctrl_c = now
+            self.append_line(Text("[Ctrl+C] ещё раз для выхода (или выделите текст мышью, чтобы скопировать)."))
 
     def _restore(self) -> None:
         if self._orig_stdout is not None:
@@ -218,6 +261,7 @@ class TinyCodeTUI(App):
             from agent import TinyCodeAgent
 
             agent = TinyCodeAgent(self.config)
+            self.agent = agent
             if self.prompt:
                 agent.run_once(self.prompt)
             else:

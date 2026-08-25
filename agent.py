@@ -415,6 +415,8 @@ class TinyCodeAgent:
         self.plan_mode = False
         self._last_plan = ""
         self.sessions = SessionManager(config.workspace)
+        self.aborted = False
+        self._current_stream = None
 
     def _env_state(self) -> str:
         """Small models do not check state before acting, so state is given to them.
@@ -524,6 +526,7 @@ class TinyCodeAgent:
 
         try:
             stream = self.client.chat.completions.create(**kwargs)
+            self._current_stream = stream
             spinner.stop()
             if not silent:
                 self._llm_calls += 1
@@ -536,6 +539,7 @@ class TinyCodeAgent:
                     stream.close()
                 except Exception:
                     pass
+                self._current_stream = None
             return result
         except (openai.APITimeoutError, TimeoutError):
             spinner.stop()
@@ -555,6 +559,16 @@ class TinyCodeAgent:
             print(f"\n  [Error: {e}]\n")
             return None
 
+    def abort(self):
+        """Interrupt the running model generation / tool loop (UI triggered)."""
+        self.aborted = True
+        stream = getattr(self, "_current_stream", None)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
     def _process_stream(self, stream, silent=False):
         start = time.time()
         content = ""
@@ -569,6 +583,8 @@ class TinyCodeAgent:
 
         usage = None
         for chunk in stream:
+            if self.aborted:
+                break
             if getattr(chunk, "usage", None) is not None:
                 usage = chunk.usage
             if not chunk.choices:
@@ -612,6 +628,9 @@ class TinyCodeAgent:
                             tool_calls[idx]["name"] += tc.function.name
                         if tc.function.arguments:
                             tool_calls[idx]["args"] += tc.function.arguments
+
+        if self.aborted:
+            return None
 
         if not silent:
             elapsed = time.time() - start
@@ -895,9 +914,16 @@ class TinyCodeAgent:
         repeat_count = 0
         did_work = False
         text_only_rounds = 0
+        self.aborted = False
         for rnd in range(max_rounds):
+            if self.aborted:
+                print("\n  [прервано пользователем]\n")
+                return
             is_last = rnd == max_rounds - 1
             msg = self._call_llm(silent=silent, use_tools=not is_last)
+            if self.aborted:
+                print("\n  [прервано пользователем]\n")
+                return
             if msg is None:
                 msg = self._call_llm(silent=silent, force_prompt="Continue with the next step.")
                 if msg is None:
@@ -1076,8 +1102,15 @@ class TinyCodeAgent:
 
     def _process_plan_turn(self):
         print("  [analyzing and creating plan...]")
+        self.aborted = False
         for rnd in range(3):
+            if self.aborted:
+                print("\n  [прервано пользователем]\n")
+                return
             msg = self._call_llm(silent=True, max_tokens=self.config.plan_tokens)
+            if self.aborted:
+                print("\n  [прервано пользователем]\n")
+                return
             if msg is None:
                 msg = self._call_llm(silent=True, force_prompt="Output your plan now. No more analysis needed.", max_tokens=self.config.plan_tokens)
                 if msg is None:
