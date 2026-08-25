@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -25,7 +25,9 @@ class Config:
     temperature: float = 0.6
     action_temperature: float = 0.1
 
-    workspace: Path = Path.cwd()
+    # Evaluated per instance: a bare default would freeze the directory that
+    # happened to be current when this module was first imported.
+    workspace: Path = field(default_factory=Path.cwd)
 
     permission_mode: str = "ask"
 

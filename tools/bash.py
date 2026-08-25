@@ -32,8 +32,14 @@ def run_bash(command: str, timeout: int = 30) -> str:
         timeout: Maximum execution time in seconds (default 30, max 120)
     """
     try:
-        safe_timeout = min(timeout, 120)
+        timeout = int(timeout)
+    except (TypeError, ValueError):
+        timeout = 30
+    # Bound outside the try block: referencing it from the TimeoutExpired
+    # handler raised UnboundLocalError when the failure happened earlier.
+    safe_timeout = max(1, min(timeout, 120))
 
+    try:
         if sys.platform == "win32":
             command = _sanitize_cmd(command)
 
@@ -122,11 +128,46 @@ def _sanitize_cmd(command: str) -> str:
     gets a corrective hint rather than a silent rewrite.
     """
     cmd = command.strip()
-    cmd = re.sub(r"^\s*cd\s+(?:[\"'][^\"']*[\"']|\S+)\s*(?:&&|;)\s*", "", cmd)
+    # Only a no-op `cd` into the workspace is dropped. Stripping every leading
+    # `cd X && ...` silently changed the working directory of a legitimate
+    # command ("cd build && cmake .." ran in the wrong place and failed).
+    cmd = re.sub(
+        r"^\s*cd\s+(?:\.|[\"']\.[\"'])\s*(?:&&|;)\s*", "", cmd
+    )
     cmd = re.sub(r"\bpython3(?:\.\d+)?\b", "python", cmd)
     cmd = re.sub(r"\bpip3\b", "pip", cmd)
     cmd = re.sub(r"\s*2>\s*/dev/null", "", cmd)
     cmd = re.sub(r"\s*1?>\s*/dev/null", "", cmd)
     cmd = re.sub(r"\s+2>&1\s*\|\s*cat\b", "", cmd)
-    cmd = re.sub(r"[ \t]{2,}", " ", cmd).strip().strip(";").strip()
-    return cmd
+    cmd = _squeeze_spaces_outside_quotes(cmd)
+    return cmd.strip().strip(";").strip()
+
+
+def _squeeze_spaces_outside_quotes(cmd: str) -> str:
+    """Collapse runs of whitespace, but never inside a quoted string.
+
+    A blanket re.sub rewrote the user's own data: the commit message in
+    `git commit -m "fix:  spacing"` came out with the spacing altered.
+    """
+    out = []
+    quote = None
+    prev_space = False
+    for ch in cmd:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            prev_space = False
+            continue
+        if ch in " \t":
+            if not prev_space:
+                out.append(" ")
+            prev_space = True
+            continue
+        out.append(ch)
+        prev_space = False
+    return "".join(out)

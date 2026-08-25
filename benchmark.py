@@ -1,12 +1,12 @@
-﻿"""Benchmark: measure tiny-code model performance on real coding tasks."""
+"""Benchmark: measure tiny-code model performance on real coding tasks."""
 
 import json
 import time
-import sys
 from pathlib import Path
 
 from agent import TinyCodeAgent
 from config import Config
+from system_prompt import SYSTEM_PROMPT
 
 
 TASKS = [
@@ -29,7 +29,7 @@ TASKS = [
 ]
 
 
-def run_benchmark(config: Config, tasks: list) -> list:
+def run_benchmark(config: Config, tasks: list) -> tuple[list, float]:
     results = []
     total_start = time.time()
 
@@ -39,12 +39,12 @@ def run_benchmark(config: Config, tasks: list) -> list:
         print(f"{'='*60}")
 
         agent = TinyCodeAgent(config)
-        agent.messages.append({"role": "system", "content": "You are a helpful coding assistant."})
-        agent.messages.append({"role": "user", "content": task["prompt"]})
+        # _add_msg keeps the context estimate in sync; appending directly
+        # leaves it at zero, so trimming never kicks in during a long run.
+        agent._add_msg({"role": "system", "content": SYSTEM_PROMPT})
+        agent._add_msg({"role": "user", "content": task["prompt"]})
 
         round_start = time.time()
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
 
         try:
             agent._process_turn(max_rounds=5)
@@ -60,19 +60,16 @@ def run_benchmark(config: Config, tasks: list) -> list:
                 elif m.get("role") == "assistant":
                     completion_tokens += len(c) // 4
 
-            total_prompt_tokens = prompt_tokens
-            total_completion_tokens = completion_tokens
-
             results.append({
                 "task": task["name"],
                 "status": "ok",
                 "elapsed_s": round(elapsed, 2),
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "token_rate": round(total_completion_tokens / elapsed, 2) if elapsed > 0 else 0,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "token_rate": round(completion_tokens / elapsed, 2) if elapsed > 0 else 0,
             })
 
-            print(f"\n  Time: {elapsed:.2f}s | Prompt tok: {total_prompt_tokens} | Completion tok: {total_completion_tokens} | Rate: {results[-1]['token_rate']} tok/s")
+            print(f"\n  Time: {elapsed:.2f}s | Prompt tok: {prompt_tokens} | Completion tok: {completion_tokens} | Rate: {results[-1]['token_rate']} tok/s")
 
         except Exception as e:
             elapsed = time.time() - round_start

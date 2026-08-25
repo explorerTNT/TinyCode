@@ -47,6 +47,11 @@ def _fallback_glob(pattern: str, search_path: Path) -> str:
     # An explicit pattern means the model asked for these files on purpose.
     explicit = pattern not in ("*", "*.*", "")
 
+    # A pattern containing a separator addresses a path ("src/*.py"), which
+    # never matches when only the bare file name is tested.
+    norm_pattern = pattern.replace("\\", "/")
+    path_scoped = "/" in norm_pattern
+
     for root, dirs, files in os.walk(str(search_path)):
         dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
 
@@ -57,7 +62,20 @@ def _fallback_glob(pattern: str, search_path: Path) -> str:
             scanned += 1
             if scanned > MAX_FILES:
                 return f"Error: Too many files ({MAX_FILES}+). Narrow your search."
-            if fnmatch.fnmatch(name, pattern):
+            if path_scoped:
+                rel_posix = (
+                    (Path(root) / name).relative_to(search_path).as_posix()
+                )
+                matched = fnmatch.fnmatch(rel_posix, norm_pattern)
+                # "src/*.py" should also reach nested files, matching how the
+                # model expects a directory-scoped glob to behave.
+                if not matched and "**" not in norm_pattern:
+                    matched = fnmatch.fnmatch(
+                        rel_posix, norm_pattern.replace("/", "/*", 1)
+                    )
+            else:
+                matched = fnmatch.fnmatch(name, pattern)
+            if matched:
                 if not explicit and Path(name).suffix.lower() in NOISE_EXTS:
                     hidden += 1
                     continue

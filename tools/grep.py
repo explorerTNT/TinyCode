@@ -1,6 +1,5 @@
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -12,6 +11,16 @@ def search_files(pattern: str, path: str = ".", include: str = None) -> str:
         path: Directory to search in (default: current workspace)
         include: Optional file glob pattern to filter (e.g. "*.py")
     """
+    import re
+
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        return (
+            f"Error: Invalid regex '{pattern}': {e}. "
+            "Escape regex metacharacters like ( ) [ ] * + ? to search for them literally."
+        )
+
     try:
         search_path = Path(path).resolve()
         if not search_path.exists():
@@ -38,7 +47,7 @@ def _grep_single_file(pattern: str, filepath: Path) -> str:
     import re
 
     try:
-        regex = re.compile(pattern)
+        regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
         return f"Error: Invalid regex '{pattern}': {e}"
 
@@ -85,7 +94,10 @@ _RG_PATH = _find_rg()
 def _try_rg(pattern: str, path: str, include: str = None) -> str | None:
     rg_bin = _RG_PATH or "rg"
     try:
-        cmd = [rg_bin, "-n", pattern, str(path)]
+        # -i keeps ripgrep consistent with the pure-Python fallback, which has
+        # always been case-insensitive. Without it the same query returned
+        # different results depending on whether ripgrep was installed.
+        cmd = [rg_bin, "-n", "-i", pattern, str(path)]
         if include:
             glob = f"*.{include.lstrip('*.')}" if "." not in include else include
             cmd.extend(["-g", glob])
@@ -100,7 +112,10 @@ def _try_rg(pattern: str, path: str, include: str = None) -> str | None:
 
         output = result.stdout.rstrip() if result.stdout else ""
         if not output:
-            return None
+            # rg exited cleanly with no hits. Returning None here made the
+            # caller redo the whole scan in Python just to reach the same
+            # answer, which on a large tree costs seconds for nothing.
+            return f"No matches for '{pattern}' in {path}"
 
         lines = output.split("\n")
         capped = lines[:50]

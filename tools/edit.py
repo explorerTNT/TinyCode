@@ -13,6 +13,18 @@ def _read_text(filepath: Path) -> tuple[str, str]:
         return f.read(), "utf-8"
 
 
+def _match_newlines(text: str, content: str) -> str:
+    """Re-encode `text` with the newline style the file already uses.
+
+    The model always emits \\n. Splicing that into a CRLF file leaves mixed
+    endings, which then breaks the next old_string match on the same file.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\r\n" in content:
+        return normalized.replace("\n", "\r\n")
+    return normalized
+
+
 def _near_miss(content: str, old_string: str, max_hits: int = 3) -> str:
     """Show real lines resembling a failed old_string.
 
@@ -99,6 +111,10 @@ def _replace_lines(
         return f"Error: end_line {end} is out of range (file has {total} lines)"
 
     replaced = lines[start - 1:end]
+    # The model may send \r\n, \n or a mix regardless of what the file uses.
+    # Splitting on "\n" alone leaves a stray \r on every line, which then gets
+    # joined with the file's own newline and produces "\r\r\n".
+    new_text = new_text.replace("\r\n", "\n").replace("\r", "\n")
     new_lines = new_text.split("\n") if new_text else []
     # Strip a trailing blank the model may append to its replacement text.
     if len(new_lines) > 1 and new_lines[-1] == "":
@@ -227,7 +243,11 @@ def edit_file(
         if crlf and "\r\n" not in old_string:
             content_cmp = content.replace("\r\n", "\n")
             if content_cmp.count(old_string) == 1:
-                new_cmp = content_cmp.replace(old_string, new_string, 1)
+                # new_string must be LF here as well: the whole buffer is
+                # converted to CRLF below, so any \r left inside it would
+                # become \r\r\n.
+                new_lf = new_string.replace("\r\n", "\n").replace("\r", "\n")
+                new_cmp = content_cmp.replace(old_string, new_lf, 1)
                 new_content = new_cmp.replace("\n", "\r\n")
                 with open(filepath, "w", encoding=used_encoding, newline="") as f:
                     f.write(new_content)
@@ -248,7 +268,7 @@ def edit_file(
             located, note = _locate_block(content, old_string)
             if located is not None:
                 start, end = located
-                new_content = content[:start] + new_string + content[end:]
+                new_content = content[:start] + _match_newlines(new_string, content) + content[end:]
                 with open(filepath, "w", encoding=used_encoding, newline="") as f:
                     f.write(new_content)
                 diff = len(new_content) - len(content)
@@ -280,7 +300,7 @@ def edit_file(
                 "Provide more surrounding context to make old_string unique."
             )
 
-        new_content = content.replace(old_string, new_string, 1)
+        new_content = content.replace(old_string, _match_newlines(new_string, content), 1)
 
         if new_content == content:
             # old_string WAS found (count == 1 above), so the only way the file

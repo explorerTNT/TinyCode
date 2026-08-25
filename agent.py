@@ -118,7 +118,6 @@ def _is_xml_tool_call(content: str) -> bool:
 
 
 def _strip_xml_toolcalls(text: str) -> str:
-    import re
     text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
     text = re.sub(r"<function>.*?</function>", "", text, flags=re.DOTALL)
     text = re.sub(r"<invoke>.*?</invoke>", "", text, flags=re.DOTALL)
@@ -134,7 +133,6 @@ def _strip_xml_toolcalls(text: str) -> str:
 
 
 def _parse_xml_toolcalls(content: str) -> list | None:
-    import re
     calls = []
     for m in re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL):
         text = m.group(1).strip()
@@ -299,33 +297,41 @@ class ContextManager:
         self.estimated = 0
 
     def trim(self, messages: list, system_idx: int = 0) -> list:
-        if self.estimated < self.max_tokens - self.reserve:
-            return messages
         if not messages:
+            return messages
+
+        budget = self.max_tokens - self.reserve
+        # `estimated` only accumulates pushes and is reset by a previous trim,
+        # so it under-reports once trimmed history keeps growing. Measure the
+        # real cost instead, otherwise an oversize prompt reaches the server
+        # and llama.cpp rejects it with HTTP 400.
+        self.estimated = sum(count_message_tokens(m) for m in messages)
+        if self.estimated < budget:
             return messages
 
         system = messages[system_idx]
         rest = messages[system_idx + 1:]
 
-        budget = self.max_tokens - self.reserve
-        total = count_message_tokens(system)
+        marker = {"role": "system", "content": "[earlier context trimmed]"}
+        # The marker is part of the prompt too, so its cost is reserved up
+        # front rather than added after the budget has already been spent.
+        total = count_message_tokens(system) + count_message_tokens(marker)
         picked = []
-        dropped = 0
 
         for m in reversed(rest):
             t = count_message_tokens(m)
             if total + t > budget:
-                dropped += 1
-                continue
+                break
             picked.append(m)
             total += t
 
+        dropped = len(rest) - len(picked)
         picked.reverse()
         picked = _drop_orphan_tools(picked)
 
         kept = [system]
         if dropped:
-            kept.append({"role": "system", "content": "[earlier context trimmed]"})
+            kept.append(marker)
         kept.extend(picked)
 
         self.estimated = sum(count_message_tokens(m) for m in kept)
@@ -334,16 +340,20 @@ class ContextManager:
 
 HELP_TEXT = """
 Commands:
-  /session              Session save/load/resume management
+  /help                 Show this help
+  /session save [name]  Save the current session
+  /session load [name]  Load a session (last one if no name given)
+  /session list         List saved sessions
+  /sessions             Same as /session list
   /clear                Clear conversation, start fresh
-  /new                  Start a new session (clear context)
+  /new                  Start a new session (previous one is saved)
   /plan [desc]          Enter plan mode (analyze first, then act)
   /compact              Summarize and shrink context
   /exit                 End session
 
-  ! <command>           Run a bash command directly
+  ! <command>           Run a shell command directly
 
-  Tab to autocomplete file paths. Ctrl+C to interrupt.
+  Ctrl+C to interrupt.
 """
 
 
@@ -472,7 +482,10 @@ class TinyCodeAgent:
                 elif cur_content:
                     prev["content"] = cur_content
                 if m.get("tool_calls"):
-                    prev.setdefault("tool_calls", []).extend(m["tool_calls"])
+                    # A copy is required: dict(m) is shallow, so the tool_calls
+                    # list is still shared with self.messages. Extending it in
+                    # place appends to the real history on every LLM call.
+                    prev["tool_calls"] = list(prev.get("tool_calls") or []) + list(m["tool_calls"])
             else:
                 normalized.append(dict(m))
 
@@ -610,8 +623,12 @@ class TinyCodeAgent:
                 if not silent:
                     _status("модель отвечает", len(content))
                 if len(content) > 600:
-                    tail = content[-200:].lower()
-                    prev = content[: -200]
+                    # Both sides must be lowered; comparing a lowered tail
+                    # against the raw text missed every repetition that
+                    # contained a capital letter.
+                    lowered = content.lower()
+                    tail = lowered[-200:]
+                    prev = lowered[:-200]
                     if prev.rfind(tail) >= max(0, len(prev) - 400):
                         repeated = True
                         break
@@ -726,22 +743,25 @@ class TinyCodeAgent:
             resolved = candidate.resolve() if candidate.is_absolute() else (ws / candidate).resolve()
             resolved.relative_to(ws)
             return None
-        except (ValueError, OSError):
+        except ValueError:
+            # Genuinely outside the workspace - fall through to repair/refuse.
             pass
+        except OSError:
+            return f"Error: '{raw}' is not a usable path."
 
         # Small models mangle long absolute paths ("ai_sa sandbox\calc.py").
         # If the file name alone is unambiguous and exists in the workspace,
         # repair it instead of refusing (a hard error sends it into a retry loop).
-        name = Path(raw.replace("/", "\\")).name
-        if name and name not in (".", ".."):
-            repaired = (ws / name).resolve()
+        basename = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if basename and basename not in (".", ".."):
+            repaired = (ws / basename).resolve()
             try:
                 repaired.relative_to(ws)
             except ValueError:
                 repaired = None
             if repaired is not None and repaired.exists():
-                args["path"] = name
-                print(f"  [path corrected: {raw!r} -> {name!r}]")
+                args["path"] = basename
+                print(f"  [path corrected: {raw!r} -> {basename!r}]")
                 return None
 
         candidates = suggest_files(raw, ws)
@@ -750,8 +770,8 @@ class TinyCodeAgent:
             # leading segments, but almost always keeps the file name intact.
             # If exactly one workspace file has that name, repair silently
             # instead of failing (a hard error starts a wrong-path guessing loop).
-            if name and name not in (".", ".."):
-                exact = [c for c in candidates if Path(c).name.lower() == name.lower()]
+            if basename and basename not in (".", ".."):
+                exact = [c for c in candidates if Path(c).name.lower() == basename.lower()]
                 if len(exact) == 1:
                     args["path"] = exact[0]
                     print(f"  [path corrected: {raw!r} -> {exact[0]!r}]")
@@ -760,10 +780,13 @@ class TinyCodeAgent:
                 f"Error: '{raw}' is outside the project directory. "
                 f"Did you mean:\n" + "\n".join(f"  {c}" for c in candidates)
             )
-            return (
-                f"Error: '{raw}' is outside the project directory. "
-                "Use a bare relative name like calc.py instead."
-            )
+
+        # No repair was possible. Refusing is mandatory: falling through here
+        # would return None and hand the tool an unrestricted path.
+        return (
+            f"Error: '{raw}' is outside the project directory. "
+            "Use a bare relative name like calc.py instead."
+        )
 
     def _critic_check(self, name: str, args: dict) -> str | None:
         """Cheap pre-execution sanity check for obviously bad tool calls.
@@ -865,15 +888,22 @@ class TinyCodeAgent:
 
         fn = self.tool_map[name]
 
-        if name == "run_bash":
-            if sys.platform == "win32":
-                from tools.bash import _sanitize_cmd
+        if name == "run_bash" and sys.platform == "win32":
+            from tools.bash import _sanitize_cmd
 
-                original = args.get("command", "")
-                cleaned = _sanitize_cmd(original)
-                if cleaned != original:
-                    print(f"  [command normalized: {cleaned}]")
-                    args["command"] = cleaned
+            original = args.get("command", "")
+            cleaned = _sanitize_cmd(original)
+            if cleaned != original:
+                print(f"  [command normalized: {cleaned}]")
+                args["command"] = cleaned
+
+        # The critic runs before any prompt: asking the user to approve a
+        # command that is going to be rejected anyway is pure noise.
+        critic = self._critic_check(name, args)
+        if critic:
+            return critic
+
+        if name == "run_bash":
             if not self.permissions.check_bash(args.get("command", "")):
                 return "Error: Command rejected by user"
 
@@ -884,19 +914,29 @@ class TinyCodeAgent:
         if name == "run_bash":
             print("  [команда выполняется…]", flush=True)
 
-        critic = self._critic_check(name, args)
-        if critic:
-            return critic
-
         orig_cwd = os.getcwd()
         try:
             if self.config.workspace:
                 os.chdir(self.config.workspace)
             result = str(fn(**args))
+        except TypeError as e:
+            # Almost always the model inventing or omitting a parameter. Say so
+            # explicitly, otherwise it reads this as a bug in the tool and
+            # retries the identical call.
+            allowed = ", ".join(
+                p for p in inspect.signature(fn).parameters if p != "config"
+            )
+            return (
+                f"Error: wrong arguments for {name}: {e}. "
+                f"Valid parameters are: {allowed}."
+            )
         except Exception as e:
             return f"Error executing {name}: {e}"
         finally:
-            os.chdir(orig_cwd)
+            try:
+                os.chdir(orig_cwd)
+            except OSError:
+                pass
 
         if name in ("write_file", "edit_file") and not result.startswith("Error:"):
             verify = self._verify_file(args.get("path", ""))
@@ -1232,9 +1272,13 @@ class TinyCodeAgent:
 
         if sub == "/session":
             args = parts[1] if len(parts) > 1 else ""
+            # Splitting on the verb avoids slicing by a hard-coded width, which
+            # silently ate a character ("resume foo"[5:] -> "e foo").
+            verb, _, rest = args.partition(" ")
+            verb, rest = verb.strip().lower(), rest.strip()
 
-            if args.startswith("save"):
-                name = args[4:].strip() or f"session_{int(time.time())}"
+            if verb == "save":
+                name = rest or f"session_{int(time.time())}"
                 path = self.sessions.save(
                     name, self.messages, self.plan_mode,
                     self.config.model_name, str(self.config.workspace),
@@ -1242,8 +1286,8 @@ class TinyCodeAgent:
                 print(f"  [session saved: {path.name}]\n")
                 return True
 
-            if args.startswith("load") or args.startswith("resume"):
-                name = args[5:].strip() if len(args) > 5 else ""
+            if verb in ("load", "resume"):
+                name = rest
                 if not name:
                     name = self.sessions.last_session()
                     if not name:
@@ -1261,10 +1305,15 @@ class TinyCodeAgent:
                     return True
                 self.messages = data.get("messages", [])
                 self.plan_mode = data.get("plan_mode", False)
+                # The estimate still reflects the discarded conversation, so
+                # without a resync the restored history is never trimmed.
+                self.ctx.reset()
+                for m in self.messages:
+                    self.ctx.push(m)
                 print(f"  [resumed session: {data.get('name', name)} ({len(self.messages)} messages)]\n")
                 return True
 
-            if args.startswith("list"):
+            if verb == "list":
                 return self._handle_session_command("/sessions")
 
             print("  Usage: /session save [name] | /session load [name] | /session list\n")
@@ -1342,7 +1391,10 @@ class TinyCodeAgent:
         )
 
     def run(self):
-        self._add_msg({"role": "system", "content": SYSTEM_PROMPT})
+        # A resumed session already carries its own system prompt; appending a
+        # second one mid-history breaks templates that require it to be first.
+        if not self.messages:
+            self._add_msg({"role": "system", "content": SYSTEM_PROMPT})
 
         print(f"  tiny-code \u2014 model: {self.config.model_name}")
         print(f"  workspace: {self.config.workspace.resolve()}")
@@ -1427,7 +1479,8 @@ class TinyCodeAgent:
             self._last_plan = ""
 
     def run_once(self, prompt: str):
-        self._add_msg({"role": "system", "content": SYSTEM_PROMPT})
+        if not self.messages:
+            self._add_msg({"role": "system", "content": SYSTEM_PROMPT})
         self._add_msg({"role": "user", "content": prompt})
         print()
         self._process_turn()
@@ -1485,19 +1538,7 @@ def main():
     if args.permission:
         config.permission_mode = args.permission
 
-    if not args.prompt:
-        try:
-            import textual  # noqa: F401
-            from tui import run_tui
-        except ImportError:
-            pass
-        else:
-            run_tui(config)
-            return
-
-    agent = TinyCodeAgent(config)
-
-    if args.resume:
+    def restore_session(agent) -> None:
         sm = SessionManager(config.workspace)
         if isinstance(args.resume, str) and args.resume:
             data = sm.load(args.resume)
@@ -1507,9 +1548,29 @@ def main():
         if data:
             agent.messages = data.get("messages", [])
             agent.plan_mode = data.get("plan_mode", False)
+            agent.ctx.reset()
+            for m in agent.messages:
+                agent.ctx.push(m)
             print(f"  [resumed session: {data.get('name', '?')} ({len(agent.messages)} messages)]\n")
         else:
             print("  [no session to resume]\n")
+
+    if not args.prompt:
+        try:
+            import textual  # noqa: F401
+            from tui import run_tui
+        except ImportError:
+            pass
+        else:
+            # --resume has to be applied to the agent the TUI builds itself,
+            # otherwise the flag is silently ignored in interactive mode.
+            run_tui(config, on_agent_ready=restore_session if args.resume else None)
+            return
+
+    agent = TinyCodeAgent(config)
+
+    if args.resume:
+        restore_session(agent)
 
     if args.prompt:
         agent.run_once(" ".join(args.prompt))

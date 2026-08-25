@@ -1,4 +1,4 @@
-﻿import os
+import os
 
 
 def ask_user(question: str) -> str:

@@ -9,12 +9,9 @@ status updates (carriage-return lines) drive the side panel, and blocked
 """
 from __future__ import annotations
 
-import asyncio
 import builtins
 import io
-import os
 import queue
-import signal
 import sys
 import threading
 import time
@@ -24,6 +21,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, Input, RichLog, Static, Tree
 
@@ -31,6 +29,10 @@ from tools.glob import EXCLUDE_DIRS
 
 DARK = True
 SYNTAX_THEME = "ansi_dark" if DARK else "ansi_light"
+
+# Sentinel pushed into the input queue on shutdown to release a blocked
+# input() call in the agent thread.
+_QUIT = object()
 
 
 class TUIWriter(io.TextIOBase):
@@ -47,26 +49,53 @@ class TUIWriter(io.TextIOBase):
         self._buf = ""
         self._in_code = False
         self._code_lang = "text"
+        self._lock = threading.Lock()
+
+    # Some libraries inspect these before writing; TextIOBase reports None /
+    # raises, which is enough to break them.
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    @property
+    def errors(self) -> str:
+        return "replace"
+
+    def writable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
 
     def write(self, s: str) -> int:
         if not s:
             return 0
-        if "\r" in s and "\n" not in s:
-            text = s.rsplit("\r", 1)[-1].rstrip()
-            self.app.update_status(text)
-            return len(s)
-        if "\r" in s:
-            s = s.replace("\r", "")
-        self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self.app.append_line(self._render(line))
+        # write() is called from the agent worker thread. Textual widgets are
+        # not thread-safe, so only the buffering happens here; the widget calls
+        # are marshalled onto the UI thread by app.append_line/update_status.
+        with self._lock:
+            if "\r" in s and "\n" not in s:
+                text = s.rsplit("\r", 1)[-1].rstrip()
+                self.app.update_status(text)
+                return len(s)
+            if "\r" in s:
+                s = s.replace("\r", "")
+            self._buf += s
+            pending = []
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                pending.append(self._render(line))
+        for renderable in pending:
+            self.app.append_line(renderable)
         return len(s)
 
     def flush(self) -> None:
-        if self._buf:
-            self.app.append_line(self._render(self._buf))
+        with self._lock:
+            if not self._buf:
+                return
+            renderable = self._render(self._buf)
             self._buf = ""
+        self.app.append_line(renderable)
 
     def _render(self, line: str):
         stripped = line.strip()
@@ -94,21 +123,27 @@ class TinyCodeTUI(App):
     #input { margin: 0 1; }
     """
 
+    # Textual binds ctrl+c itself (system binding -> action_help_quit) and puts
+    # the terminal in raw mode, so no SIGINT is ever delivered. priority=True is
+    # what actually takes it over.
     BINDINGS = [
-        ("ctrl+c", "quit", "Выход"),
-        ("f", "refresh_files", "Файлы"),
+        Binding("ctrl+c", "interrupt", "Копировать/выход", priority=True, show=False),
+        Binding("escape", "abort_generation", "Стоп", priority=True, show=False),
+        Binding("f2", "refresh_files", "Файлы"),
     ]
 
-    def __init__(self, config, prompt=None):
+    def __init__(self, config, prompt=None, on_agent_ready=None):
         super().__init__()
         self.config = config
         self.prompt = prompt
+        self.on_agent_ready = on_agent_ready
         self._input_q: "queue.Queue[str]" = queue.Queue()
         self._orig_stdout = None
         self._orig_input = None
         self.agent = None
         self._last_ctrl_c = 0.0
-        self._loop = None
+        self._awaiting_input = False
+        self._ui_thread_id = threading.get_ident()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -125,6 +160,7 @@ class TinyCodeTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._ui_thread_id = threading.get_ident()
         self.theme = "textual-dark"
         side = self.query_one("#status", Static)
         side.update(Text(
@@ -139,54 +175,25 @@ class TinyCodeTUI(App):
         self._orig_input = builtins.input
         sys.stdout = TUIWriter(self)
         builtins.input = self._tui_input
-        self._loop = asyncio.get_running_loop()
-        self._install_sigint()
         threading.Thread(target=self._run_agent, daemon=True).start()
 
     def on_unmount(self) -> None:
         self._restore()
-        if self._loop is not None:
-            try:
-                self._loop.remove_signal_handler(signal.SIGINT)
-            except Exception:
-                pass
-
-    def _install_sigint(self) -> None:
-        if self._loop is None:
-            return
-        try:
-            self._loop.add_signal_handler(signal.SIGINT, self._on_sigint)
-        except (NotImplementedError, RuntimeError, ValueError):
-            try:
-                signal.signal(
-                    signal.SIGINT,
-                    lambda s, f: self._loop.call_soon_threadsafe(self._on_sigint),
-                )
-            except Exception:
-                pass
-
-    def _on_sigint(self) -> None:
-        # Ctrl+C arrives as SIGINT, not as a key event, so we handle it here.
-        self._handle_ctrl_c()
 
     def action_refresh_files(self) -> None:
         self._build_tree()
 
-    def on_key(self, event) -> None:
-        if event.key == "escape":
-            event.prevent_default()
-            # Abort only while the agent is busy (input disabled). While the
-            # user is typing, Esc does nothing special.
-            inp = self.query_one("#input", Input)
-            if inp.disabled:
-                agent = getattr(self, "agent", None)
-                if agent is not None:
-                    agent.abort()
-                    self.append_line(Text("[Esc] генерация остановлена — введите новый запрос или продолжите."))
-        # Ctrl+C is delivered as SIGINT by the terminal, not as a key event,
-        # so it is handled in _on_sigint (see _install_sigint).
+    def action_abort_generation(self) -> None:
+        # Only meaningful while the agent is busy; while the user is typing,
+        # Esc should not interrupt anything.
+        if self._awaiting_input:
+            return
+        agent = self.agent
+        if agent is not None:
+            agent.abort()
+            self.append_line(Text("[Esc] генерация остановлена — введите новый запрос или продолжите."))
 
-    def _handle_ctrl_c(self) -> None:
+    def action_interrupt(self) -> None:
         try:
             log = self.query_one("#log", RichLog)
             sel_obj = log.text_selection
@@ -218,15 +225,41 @@ class TinyCodeTUI(App):
             builtins.input = self._orig_input
 
     # ---- redirected stdout -> widgets (must run on the main thread) ----
+    def _on_ui_thread(self) -> bool:
+        return threading.get_ident() == self._ui_thread_id
+
+    def _dispatch(self, fn, *args) -> None:
+        """Run a widget update on the UI thread, wherever the caller lives.
+
+        The agent runs in a worker thread and writes through the redirected
+        stdout, so touching widgets directly from there races with Textual's
+        own rendering and drops output.
+        """
+        if self._on_ui_thread():
+            fn(*args)
+            return
+        try:
+            self.call_from_thread(fn, *args)
+        except Exception:
+            # The app is shutting down (or not started yet); dropping late
+            # output is better than crashing the agent thread.
+            pass
+
     def append_line(self, renderable) -> None:
         if renderable is None:
             return
+        self._dispatch(self._write_log, renderable)
+
+    def _write_log(self, renderable) -> None:
         try:
             self.query_one("#log", RichLog).write(renderable)
         except Exception:
             pass
 
     def update_status(self, text: str) -> None:
+        self._dispatch(self._write_status, text)
+
+    def _write_status(self, text: str) -> None:
         try:
             self.query_one("#status", Static).update(Text(f"статус\n{text}"))
         except Exception:
@@ -266,10 +299,17 @@ class TinyCodeTUI(App):
 
     # ---- redirected input ----
     def _tui_input(self, prompt: str = "") -> str:
-        self.call_from_thread(self._enable_input, prompt)
-        return self._input_q.get()
+        self._dispatch(self._enable_input, prompt)
+        value = self._input_q.get()
+        if value is _QUIT:
+            # The app is gone. Raising EOFError mimics a closed stdin, which
+            # agent.run() already treats as "end the session" - without it the
+            # worker thread blocks forever and the process never exits.
+            raise EOFError("TUI closed")
+        return value
 
     def _enable_input(self, prompt: str) -> None:
+        self._awaiting_input = True
         inp = self.query_one("#input", Input)
         if prompt:
             inp.placeholder = prompt
@@ -283,7 +323,14 @@ class TinyCodeTUI(App):
         inp = self.query_one("#input", Input)
         inp.value = ""
         inp.disabled = True
+        self._awaiting_input = False
         self._input_q.put(value)
+
+    def exit(self, *args, **kwargs):
+        # Unblock a worker thread parked in input() before tearing the app
+        # down, otherwise the process hangs on a non-daemon queue wait.
+        self._input_q.put(_QUIT)
+        return super().exit(*args, **kwargs)
 
     # ---- agent runner (worker thread) ----
     def _run_agent(self) -> None:
@@ -292,16 +339,23 @@ class TinyCodeTUI(App):
 
             agent = TinyCodeAgent(self.config)
             self.agent = agent
+            if self.on_agent_ready is not None:
+                self.on_agent_ready(agent)
             if self.prompt:
                 agent.run_once(self.prompt)
             else:
                 agent.run()
+        except (EOFError, SystemExit):
+            pass
         except Exception as e:  # noqa: BLE001
-            self.call_from_thread(self.append_line, Text(f"[red]FATAL: {e}[/red]"))
+            import traceback
+
+            detail = traceback.format_exc(limit=6)
+            self.append_line(Text(f"FATAL: {e}\n{detail}", style="bold red"))
         finally:
             self._restore()
-            self.call_from_thread(self.exit)
+            self._dispatch(self.exit)
 
 
-def run_tui(config, prompt=None) -> None:
-    TinyCodeTUI(config, prompt).run()
+def run_tui(config, prompt=None, on_agent_ready=None) -> None:
+    TinyCodeTUI(config, prompt, on_agent_ready).run()
