@@ -3,6 +3,7 @@ import inspect
 import re
 import sys
 import os
+import subprocess
 import collections
 import threading
 import time
@@ -32,6 +33,26 @@ def _safe_json_loads(text: str):
         return None
 
 
+# Substrings that make an auto-run verification unsafe to execute.
+_VERIFY_UNSAFE = (
+    "os.system", "subprocess", "shutil.rmtree", "os.remove",
+    "os.rmdir", "os.unlink", "os.rename", "eval(", "exec(",
+)
+
+# Regex patterns a critic pass blocks before a bash command runs.
+_CRITIC_BASH_DANGEROUS = (
+    r"rm\s+-rf\s+/", r"rm\s+-r\s+/", r"rm\s+-rf\s+~", r"rm\s+-r\s+~",
+    r"format\s+[a-z]:", r"mkfs", r":\(\)\{", r"dd\s+if=",
+    r"curl\s+.*\|\s*(sh|bash)", r"wget\s+.*\|\s*(sh|bash)",
+    r"del\s+/[fsq]", r"rmdir\s+/s",
+)
+
+_BINARY_EXTS = {
+    ".exe", ".dll", ".so", ".png", ".jpg", ".jpeg", ".gif", ".pdf",
+    ".zip", ".gz", ".tar", ".bin", ".pyc", ".obj", ".o", ".docx",
+    ".xlsx", ".pptx", ".mp3", ".mp4", ".avi",
+}
+
 SESSION_DIR = Path.home() / ".tiny-code" / "sessions"
 PLANS_DIR = Path.home() / ".tiny-code" / "plans"
 
@@ -49,7 +70,13 @@ def _build_tool_schema(fn):
         "run_bash": {"command": "shell command", "timeout": "max seconds"},
         "read_file": {"path": "file path", "offset": "start line (1)", "limit": "max lines"},
         "write_file": {"path": "file path", "content": "file content"},
-        "edit_file": {"path": "file path", "old_string": "text to find", "new_string": "replacement text"},
+        "edit_file": {
+            "path": "file path",
+            "start_line": "first line to replace (from read_file) - preferred",
+            "end_line": "last line to replace, inclusive",
+            "new_string": "replacement text",
+            "old_string": "fallback: exact text to find, if not using line numbers",
+        },
         "search_files": {"pattern": "regex to search", "path": "search dir", "include": "glob filter"},
         "list_files": {"pattern": "glob pattern", "path": "search dir"},
         "ask_user": {"question": "the question to ask"},
@@ -139,7 +166,7 @@ def _parse_xml_toolcalls(content: str) -> list | None:
 
 
 class Spinner:
-    def __init__(self, message="Thinking"):
+    def __init__(self, message="жду ответа модели…"):
         self.message = message
         self.running = False
         self.thread = None
@@ -383,6 +410,7 @@ class TinyCodeAgent:
         self.tool_schemas = [_build_tool_schema(t) for t in self.tools_list]
         self.tool_schemas.append(RESPOND_SCHEMA)
         self.messages = []
+        self._llm_calls = 0
         self.ctx = ContextManager(max_tokens=config.context_limit)
         self.plan_mode = False
         self._last_plan = ""
@@ -449,7 +477,7 @@ class TinyCodeAgent:
             normalized.append({"role": "user", "content": "Continue."})
         return normalized
 
-    def _call_llm(self, spinner_message="Thinking", silent=False, force_prompt=None, max_tokens=None, use_tools=True, no_thinking=False):
+    def _call_llm(self, spinner_message="жду ответа модели…", silent=False, force_prompt=None, max_tokens=None, use_tools=True, no_thinking=False):
         kwargs = {
             "model": self.config.model_name,
             "messages": self._normalize_messages(
@@ -458,6 +486,7 @@ class TinyCodeAgent:
             "max_tokens": max_tokens or self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "timeout": 90,
         }
 
@@ -495,6 +524,11 @@ class TinyCodeAgent:
 
         try:
             stream = self.client.chat.completions.create(**kwargs)
+            spinner.stop()
+            if not silent:
+                self._llm_calls += 1
+                sys.stdout.write(f"\r  [#{self._llm_calls} модель думает…]" + " " * 10)
+                sys.stdout.flush()
             try:
                 result = self._process_stream(stream, silent)
             finally:
@@ -502,7 +536,6 @@ class TinyCodeAgent:
                     stream.close()
                 except Exception:
                     pass
-            spinner.stop()
             return result
         except (openai.APITimeoutError, TimeoutError):
             spinner.stop()
@@ -523,13 +556,21 @@ class TinyCodeAgent:
             return None
 
     def _process_stream(self, stream, silent=False):
+        start = time.time()
         content = ""
         reasoning = ""
         tool_calls = collections.defaultdict(lambda: {"name": "", "args": "", "id": ""})
         finish_reason = None
         repeated = False
 
+        def _status(label, n):
+            sys.stdout.write(f"\r  [#{self._llm_calls} {label}: {n} ток • {time.time() - start:.0f}с]" + " " * 10)
+            sys.stdout.flush()
+
+        usage = None
         for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
             if not chunk.choices:
                 continue
 
@@ -545,16 +586,12 @@ class TinyCodeAgent:
             if rc:
                 reasoning += rc
                 if not silent:
-                    n = len(reasoning)
-                    sys.stdout.write(f"\r  [thinking {n} tok...]")
-                    sys.stdout.flush()
+                    _status("модель думает", len(reasoning))
 
             if delta.content:
                 content += delta.content
                 if not silent:
-                    n = len(content)
-                    sys.stdout.write(f"\r  [writing {n} tok...]")
-                    sys.stdout.flush()
+                    _status("модель отвечает", len(content))
                 if len(content) > 600:
                     tail = content[-200:].lower()
                     prev = content[: -200]
@@ -563,6 +600,9 @@ class TinyCodeAgent:
                         break
 
             if delta.tool_calls:
+                if not silent:
+                    sys.stdout.write(f"\r  [#{self._llm_calls} модель готовит вызов инструмента…]" + " " * 10)
+                    sys.stdout.flush()
                 for tc in delta.tool_calls:
                     idx = tc.index if tc.index is not None else len(tool_calls)
                     if tc.id:
@@ -573,8 +613,21 @@ class TinyCodeAgent:
                         if tc.function.arguments:
                             tool_calls[idx]["args"] += tc.function.arguments
 
-        if not silent and (reasoning or content):
-            sys.stdout.write("\r" + " " * 40 + "\r")
+        if not silent:
+            elapsed = time.time() - start
+            comp = getattr(usage, "completion_tokens", None) if usage else None
+            if comp is not None:
+                tok = f"{comp} ток"
+            else:
+                chars = len(reasoning) + len(content)
+                tok = f"{chars} симв"
+            if tool_calls:
+                summary = f"\r  [#{self._llm_calls} вызов инструмента • {tok} • {elapsed:.0f}с]"
+            elif len(reasoning) + len(content):
+                summary = f"\r  [#{self._llm_calls} модель • {tok} • {elapsed:.0f}с]"
+            else:
+                summary = f"\r  [#{self._llm_calls} пусто • {elapsed:.0f}с]"
+            sys.stdout.write(summary + "\n")
             sys.stdout.flush()
 
         if repeated and not tool_calls:
@@ -687,10 +740,97 @@ class TinyCodeAgent:
                 f"Error: '{raw}' is outside the project directory. "
                 f"Did you mean:\n" + "\n".join(f"  {c}" for c in candidates)
             )
-        return (
-            f"Error: '{raw}' is outside the project directory. "
-            "Use a bare relative name like calc.py instead."
-        )
+            return (
+                f"Error: '{raw}' is outside the project directory. "
+                "Use a bare relative name like calc.py instead."
+            )
+
+    def _critic_check(self, name: str, args: dict) -> str | None:
+        """Cheap pre-execution sanity check for obviously bad tool calls.
+
+        A 2B model sometimes emits self-destructive commands or writes text
+        into binary files. Catching that here (before the tool runs) is far
+        cheaper than discovering a corrupted workspace afterward.
+        """
+        if name == "run_bash":
+            cmd = str(args.get("command", "")).lower()
+            for pat in _CRITIC_BASH_DANGEROUS:
+                if re.search(pat, cmd):
+                    return (
+                        f"Error: command rejected by critic pass — matches a "
+                        f"destructive pattern ({pat!r}). Rewrite it to be safe "
+                        "or use a narrower, non-destructive command."
+                    )
+            return None
+        if name in ("write_file", "edit_file"):
+            path = str(args.get("path", ""))
+            if Path(path).suffix.lower() in _BINARY_EXTS:
+                return (
+                    f"Error: '{path}' looks like a binary file. Writing text to "
+                    "it will corrupt the file. Use a text-based format or a "
+                    "binary-safe tool."
+                )
+        return None
+
+    def _verify_file(self, path_str: str) -> str | None:
+        """Best-effort post-write check. Returns an error string to feed back
+        to the model, or None when the file looks healthy.
+
+        2B models frequently emit files that do not even parse. A cheap
+        ``py_compile`` catches the bulk of those mistakes without executing
+        anything. Runnable scripts (those with a ``__main__`` guard) get a
+        guarded runtime pass so import/runtime errors surface too.
+        """
+        try:
+            p = Path(path_str)
+            if not p.is_absolute():
+                p = (Path(self.config.workspace) / p).resolve()
+            if not p.exists() or p.suffix != ".py":
+                return None
+        except (OSError, ValueError):
+            return None
+
+        # 1) Syntax check — always safe, catches most 2B failures.
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(p)],
+                capture_output=True, text=True, timeout=25,
+                cwd=str(self.config.workspace),
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if proc.returncode != 0:
+            err_lines = [l for l in (proc.stderr or proc.stdout).splitlines() if l.strip()][-6:]
+            return (
+                "AUTO-VERIFY FAILED (syntax): the file you just wrote does not "
+                "compile. Fix the error below:\n" + "\n".join(err_lines)
+            )
+
+        # 2) Guarded runtime check for runnable scripts only.
+        try:
+            src = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        if "__main__" not in src:
+            return None
+        if any(tok in src for tok in _VERIFY_UNSAFE):
+            return None
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(p)],
+                capture_output=True, text=True, timeout=15,
+                cwd=str(self.config.workspace),
+            )
+        except subprocess.TimeoutExpired:
+            return "AUTO-VERIFY FAILED (runtime): script ran past the 15s limit — check for an infinite loop."
+        if proc.returncode != 0:
+            out = [l for l in (proc.stderr or proc.stdout).splitlines() if l.strip()][-8:]
+            return (
+                "AUTO-VERIFY FAILED (runtime): the script crashed on execution. "
+                "Fix the error below:\n" + "\n".join(out)
+            )
+        return None
 
     def _execute_tool(self, name: str, args: dict) -> str:
         if name not in self.tool_map:
@@ -721,21 +861,35 @@ class TinyCodeAgent:
             if not self.permissions.check_write(args.get("path", "")):
                 return "Error: Write rejected by user"
 
+        if name == "run_bash":
+            print("  [команда выполняется…]", flush=True)
+
+        critic = self._critic_check(name, args)
+        if critic:
+            return critic
+
         orig_cwd = os.getcwd()
         try:
             if self.config.workspace:
                 os.chdir(self.config.workspace)
-            result = fn(**args)
-            return str(result)
+            result = str(fn(**args))
         except Exception as e:
             return f"Error executing {name}: {e}"
         finally:
             os.chdir(orig_cwd)
 
+        if name in ("write_file", "edit_file") and not result.startswith("Error:"):
+            verify = self._verify_file(args.get("path", ""))
+            if verify:
+                print("  [auto-verify: ошибки в файле, возвращаю модели для фикса]")
+                result = f"{result}\n\n{verify}"
+        return result
+
     def _process_turn(self, max_rounds: int = None, silent=False):
         if max_rounds is None:
             max_rounds = self.config.max_tool_rounds
         recent_tools = []
+        recent_errors = []
         reasoning_rounds = 0
         last_content_norm = None
         repeat_count = 0
@@ -805,6 +959,9 @@ class TinyCodeAgent:
 
                     if result.startswith("Error:"):
                         print(f"  !!! {result}")
+                        recent_errors.append(f"{name}: {result[:200]}")
+                        if len(recent_errors) > 8:
+                            recent_errors.pop(0)
                     else:
                         did_work = True
                         preview = result[:120].replace("\n", " ")
@@ -827,12 +984,24 @@ class TinyCodeAgent:
                         recent_tools.pop(0)
                     same = [t for t in recent_tools if t == (name, arg_key)]
                     if len(same) >= 3:
-                        print("  [repeating same tool, prompting to move on]")
+                        print("  [repeating same tool, recovery prompt]")
+                        seen = []
+                        for e in recent_errors[-5:]:
+                            if e not in seen:
+                                seen.append(e)
+                        err_block = "\n".join(f"- {e[:300]}" for e in seen[-4:])
                         self._add_msg({
                             "role": "user",
-                            "content": "You keep trying the same tool with the same arguments. Stop. Use the information you already have and move on."
+                            "content": (
+                                "You keep calling the same tool with the same arguments "
+                                "and it keeps failing. Errors you got:\n"
+                                f"{err_block}\n"
+                                "Do NOT repeat the same call. Re-examine the situation, "
+                                "change your approach, or use a different tool."
+                            ),
                         })
                         recent_tools.clear()
+                        recent_errors.clear()
             elif content:
                 if msg.get("cut") == "repetition":
                     print("  [task finished: model repeated the answer]\n")
@@ -889,6 +1058,22 @@ class TinyCodeAgent:
             print(msg["content"].strip())
         print()
 
+    def _show_plan(self, plan: str):
+        """Store, print and persist a finished plan."""
+        self._last_plan = plan
+        steps = _count_plan_steps(plan)
+        if steps:
+            print(f"  [plan has {steps} steps, allocating up to {self.config.max_tool_rounds} rounds]")
+        print("\n" + "=" * 50)
+        print("  PLAN")
+        print("=" * 50)
+        for line in plan.strip().split("\n"):
+            print(f"  {line}")
+        print("=" * 50)
+
+        plan_path = PLANS_DIR / f"plan_{int(time.time())}.md"
+        plan_path.write_text(plan, encoding="utf-8")
+
     def _process_plan_turn(self):
         print("  [analyzing and creating plan...]")
         for rnd in range(3):
@@ -917,26 +1102,25 @@ class TinyCodeAgent:
 
             if not tc_list:
                 plan = msg.get("content", "")
-                plan = _strip_xml_toolcalls(plan)
-                self._last_plan = plan
-                steps = _count_plan_steps(plan)
-                if steps:
-                    print(f"  [plan has {steps} steps, allocating up to {self.config.max_tool_rounds} rounds]")
-                print("\n" + "=" * 50)
-                print("  PLAN")
-                print("=" * 50)
-                for line in plan.strip().split("\n"):
-                    print(f"  {line}")
-                print("=" * 50)
-
-                plan_path = PLANS_DIR / f"plan_{int(time.time())}.md"
-                plan_path.write_text(plan, encoding="utf-8")
+                self._show_plan(_strip_xml_toolcalls(plan))
                 return
 
             for tc in tc_list:
                 try:
                     name = tc["function"]["name"]
                     args = json.loads(tc["function"]["arguments"])
+                    # `respond` is offered to the model in every mode, but it
+                    # only means "I am done" - in plan mode that means the plan
+                    # itself is ready, not that a tool should run.
+                    if name == RESPOND_TOOL:
+                        plan = _strip_xml_toolcalls(str(args.get("message", "")))
+                        if plan.strip():
+                            self._show_plan(plan)
+                            return
+                        result = "Error: empty plan. Write the numbered plan as the message."
+                        print(f"  !!! {result}")
+                        self._add_msg({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                        continue
                     print(f"  [{rnd+1}/25 tool: {name}({_short_args(args)})]", flush=True)
                     result = self._execute_tool(name, args)
                 except json.JSONDecodeError:
@@ -960,15 +1144,7 @@ class TinyCodeAgent:
             plan = _strip_xml_toolcalls((msg or {}).get("content", "") or "")
 
         if plan.strip():
-            self._last_plan = plan
-            print("\n" + "=" * 50)
-            print("  PLAN")
-            print("=" * 50)
-            for line in plan.strip().split("\n"):
-                print(f"  {line}")
-            print("=" * 50)
-            plan_path = PLANS_DIR / f"plan_{int(time.time())}.md"
-            plan_path.write_text(plan, encoding="utf-8")
+            self._show_plan(plan)
         else:
             self._last_plan = ""
             print("  [model did not create a plan]\n")
