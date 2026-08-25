@@ -862,15 +862,24 @@ class TinyCodeAgent:
             return None
         if any(tok in src for tok in _VERIFY_UNSAFE):
             return None
+        # An interactive program cannot be run headless: with no stdin the very
+        # first input() raises EOFError, which looks exactly like a crash. The
+        # syntax check above already covered what can be checked safely.
+        if _is_interactive(src):
+            return None
 
         try:
             proc = subprocess.run(
                 [sys.executable, str(p)],
                 capture_output=True, text=True, timeout=15,
                 cwd=str(self.config.workspace),
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             return "AUTO-VERIFY FAILED (runtime): script ran past the 15s limit — check for an infinite loop."
+        # A stray EOFError still means "wanted input", not "broken code".
+        if proc.returncode != 0 and "EOFError" in (proc.stderr or ""):
+            return None
         if proc.returncode == 0 and not (proc.stdout or "").strip():
             # Exit code 0 is not proof of success: a logic bug (a mismatched
             # membership test, an off-by-one range) commonly yields a script
@@ -895,7 +904,12 @@ class TinyCodeAgent:
             return f"Error: Unknown tool '{name}'"
 
         if self.plan_mode and name in self.WRITE_TOOLS:
-            return "Error: Write/bash tools are disabled in PLAN MODE. Only read-only tools allowed."
+            return (
+                f"Error: `{name}` is disabled in PLAN MODE and will keep failing. "
+                "Do not call it again. Describe this step in the plan instead, "
+                "and output the finished numbered plan as text - the code is "
+                "written only after the plan is approved."
+            )
 
         err = self._enforce_workspace(name, args)
         if err:
@@ -1035,12 +1049,34 @@ class TinyCodeAgent:
                             return
                         print(f"  [{rnd+1}/{max_rounds} tool: {name}({_short_args(args)})]", flush=True)
                         if msg.get("truncated") and name in ("write_file", "edit_file"):
-                            result = (
-                                "Error: your tool call was cut off mid-generation, so the "
-                                "content is incomplete and was NOT written. Write the file in "
-                                "smaller pieces: create it with the first part, then append the "
-                                "rest with edit_file."
-                            )
+                            target = str(args.get("path", "the file"))
+                            exists = False
+                            try:
+                                cand = Path(target)
+                                if not cand.is_absolute():
+                                    cand = Path(self.config.workspace) / cand
+                                exists = cand.exists()
+                            except (OSError, ValueError):
+                                pass
+                            if exists:
+                                # Rewriting a whole working file to change a few
+                                # lines is what caused the cut-off. Point at the
+                                # surgical tool instead of repeating the advice
+                                # that just failed.
+                                result = (
+                                    f"Error: your reply was cut off - {target} was NOT "
+                                    "modified. Do NOT rewrite the whole file. Call "
+                                    "read_file to see the line numbers, then fix only the "
+                                    "broken lines with edit_file(start_line=..., "
+                                    "end_line=..., new_string=...)."
+                                )
+                            else:
+                                result = (
+                                    "Error: your tool call was cut off mid-generation, so the "
+                                    "content is incomplete and was NOT written. Write the file in "
+                                    "smaller pieces: create it with the first part, then append the "
+                                    "rest with edit_file."
+                                )
                         else:
                             result = self._execute_tool(name, args)
                     except json.JSONDecodeError:
@@ -1173,6 +1209,7 @@ class TinyCodeAgent:
     def _process_plan_turn(self):
         print("  [analyzing and creating plan...]")
         self.aborted = False
+        blocked_writes = 0
         for rnd in range(3):
             if self.aborted:
                 print("\n  [прервано пользователем]\n")
@@ -1208,10 +1245,10 @@ class TinyCodeAgent:
                 self._show_plan(_strip_xml_toolcalls(plan))
                 return
 
-            for tc in tc_list:
+            for tc in tc_list[:MAX_CALLS_PER_ROUND]:
                 try:
                     name = tc["function"]["name"]
-                    args = json.loads(tc["function"]["arguments"])
+                    args = _safe_json_loads(tc["function"]["arguments"]) or {}
                     # `respond` is offered to the model in every mode, but it
                     # only means "I am done" - in plan mode that means the plan
                     # itself is ready, not that a tool should run.
@@ -1234,6 +1271,23 @@ class TinyCodeAgent:
                 if result.startswith("Error:"):
                     print(f"  !!! {result}")
                 self._add_msg({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+                blocked_writes += name in self.WRITE_TOOLS
+                if blocked_writes >= 2:
+                    # Repeatedly reaching for a disabled tool means the mode
+                    # itself was not understood; restating the rule works,
+                    # whereas the per-call error clearly does not.
+                    blocked_writes = 0
+                    self._add_msg({
+                        "role": "user",
+                        "content": (
+                            "You are in PLAN MODE. Writing files and running commands "
+                            "is impossible here - those tools stay disabled no matter "
+                            "how you call them. Do not attempt them again. Output the "
+                            "numbered plan as plain text right now; the code itself "
+                            "will be written after the plan is approved."
+                        ),
+                    })
 
         msg = self._call_llm(silent=True, force_prompt="Stop using tools. Output your numbered plan now.", max_tokens=self.config.plan_tokens)
         plan = _strip_xml_toolcalls((msg or {}).get("content", "") or "")
@@ -1514,6 +1568,21 @@ class TinyCodeAgent:
         print()
         self._process_turn()
         print()
+
+
+_INTERACTIVE_TOKENS = (
+    "input(", "sys.stdin", "raw_input(", "getpass", "msvcrt.getch",
+    "keyboard.read", "curses.", "pygame.", "tkinter", "Tk(",
+)
+
+
+def _is_interactive(src: str) -> bool:
+    """True when a script waits for user input or opens a GUI window.
+
+    Such a program cannot be verified by running it headless, so the runtime
+    pass has to be skipped rather than reported as a crash.
+    """
+    return any(tok in src for tok in _INTERACTIVE_TOKENS)
 
 
 def _summarize_traceback(text: str, keep: int = 8) -> list[str]:
