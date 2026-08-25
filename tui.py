@@ -2,10 +2,14 @@
 
 The agent still writes to ``sys.stdout`` and calls ``input()`` as in the
 console version. Inside the TUI we redirect both: stdout lines land in a
-scrolling :class:`RichLog` (with fenced code blocks syntax-highlighted), live
-status updates (carriage-return lines) drive the side panel, and blocked
-``input()`` calls are satisfied by the bottom input field. This keeps
-``agent.py`` completely untouched.
+scrolling log (with fenced code blocks syntax-highlighted), live status
+updates (carriage-return lines) drive the side panel, and blocked ``input()``
+calls are satisfied by the bottom input field. This keeps ``agent.py``
+completely untouched.
+
+The log is a :class:`VerticalScroll` of :class:`Static` widgets rather than a
+``RichLog``: RichLog renders its lines without offset metadata, so Textual
+cannot select or copy any text out of it.
 """
 from __future__ import annotations
 
@@ -22,8 +26,8 @@ from rich.text import Text
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Input, RichLog, Static, Tree
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Footer, Header, Input, Static, Tree
 
 from tools.glob import EXCLUDE_DIRS
 
@@ -33,6 +37,9 @@ SYNTAX_THEME = "ansi_dark" if DARK else "ansi_light"
 # Sentinel pushed into the input queue on shutdown to release a blocked
 # input() call in the agent thread.
 _QUIT = object()
+
+# Upper bound on log widgets kept alive; older lines are discarded.
+MAX_LOG_LINES = 2000
 
 
 class TUIWriter(io.TextIOBase):
@@ -117,6 +124,7 @@ class TinyCodeTUI(App):
     Screen { background: $surface; }
     #body { height: 1fr; }
     #log { width: 3fr; height: 100%; border: round $accent; }
+    #log > Static { height: auto; }
     #side { width: 1fr; height: 100%; }
     #status { height: auto; border: round $accent; padding: 1; margin-bottom: 1; }
     #files { height: 1fr; border: round $accent; }
@@ -148,7 +156,10 @@ class TinyCodeTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Horizontal(
-            RichLog(id="log", markup=False, wrap=True),
+            # RichLog cannot be selected with the mouse (its lines carry no
+            # offset metadata), so the log is a scrollable stack of Static
+            # widgets instead - those support selection and copying.
+            VerticalScroll(id="log"),
             Vertical(
                 Static(id="status"),
                 Tree(self.config.workspace.name, id="files"),
@@ -194,20 +205,17 @@ class TinyCodeTUI(App):
             self.append_line(Text("[Esc] генерация остановлена — введите новый запрос или продолжите."))
 
     def action_interrupt(self) -> None:
+        # Ask the screen rather than a single widget: the selection may span
+        # several Static lines in the log.
         try:
-            log = self.query_one("#log", RichLog)
-            sel_obj = log.text_selection
-            if sel_obj is None:
-                sel = ""
-            else:
-                got = log.get_selection(sel_obj)
-                sel = (got[0] if got else "").strip()
+            sel = (self.screen.get_selected_text() or "").strip()
         except Exception:
             sel = ""
         if sel:
             try:
                 self.copy_to_clipboard(sel)
                 self.append_line(Text(f"[Ctrl+C] скопировано в буфер: {len(sel)} симв."))
+                self.screen.clear_selection()
             except Exception:
                 self.append_line(Text("[Ctrl+C] буфер недоступен, не удалось скопировать."))
             return
@@ -252,7 +260,22 @@ class TinyCodeTUI(App):
 
     def _write_log(self, renderable) -> None:
         try:
-            self.query_one("#log", RichLog).write(renderable)
+            log = self.query_one("#log", VerticalScroll)
+        except Exception:
+            return
+        try:
+            line = Static(renderable)
+            log.mount(line)
+            # Keep the widget count bounded: an unbounded log makes every
+            # relayout slower until the UI crawls.
+            children = log.children
+            if len(children) > MAX_LOG_LINES:
+                for stale in children[: len(children) - MAX_LOG_LINES]:
+                    stale.remove()
+            # Only follow the tail when the user has not scrolled up to read
+            # something, otherwise the view jumps away mid-selection.
+            if log.scroll_offset.y >= log.max_scroll_y - 2:
+                log.scroll_end(animate=False)
         except Exception:
             pass
 

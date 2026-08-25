@@ -20,6 +20,10 @@ RULES:
 2. Read a file before editing it.
 3. Edit by line numbers: read_file prints them, so pass start_line/end_line to
    edit_file. Do not retype existing code as old_string.
+   A traceback names the file and the line ("line 33, in is_safe") - read that
+   range, then edit those exact line numbers. Never guess a function signature
+   from memory; if edit_file says "Could not find", re-read the file and use
+   the line numbers it printed instead of rewording old_string.
 4. Write complete, working code. No TODOs or placeholders.
 5. After a tool returns data, USE THAT DATA. Do not call another tool to re-verify it.
 6. If a tool fails, read the error and change approach. Never retry the same call.

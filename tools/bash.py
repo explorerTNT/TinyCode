@@ -80,7 +80,15 @@ def run_bash(command: str, timeout: int = 30) -> str:
             output_parts.append(f"--- stderr ---\n{err[:5000]}")
 
         if not output_parts:
-            output_parts.append("(no output)")
+            if re.search(r"\bpython\b.*\.py\b", command):
+                # Running a script that prints nothing is nearly always a bug,
+                # but a bare "(no output)" reads like success to a small model.
+                output_parts.append(
+                    "(no output — the script printed nothing. If it was meant "
+                    "to display something, this is a logic bug, not a success.)"
+                )
+            else:
+                output_parts.append("(no output)")
 
         output = "\n".join(output_parts)
 

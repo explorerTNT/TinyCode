@@ -145,6 +145,7 @@ def _locate_block(content: str, probe: str) -> tuple[tuple[int, int] | None, str
     Returns ((start, end), note) or (None, "").
     """
     import difflib
+    import re
 
     probe_lines = probe.strip("\n").split("\n")
     file_lines = content.split("\n")
@@ -193,7 +194,60 @@ def _locate_block(content: str, probe: str) -> tuple[tuple[int, int] | None, str
     if best_ratio >= 0.92 and best_ratio - runner_up >= 0.05:
         return span_bounds(best_i), f" [fuzzy match, {best_ratio:.0%} similar]"
 
+    # Level 3: anchor on a declaration. Small models misremember a signature
+    # ("def is_safe(board, r, n)" for "...r, c"), which drops similarity below
+    # any safe threshold even though the target is unambiguous. If the probe
+    # starts at a def/class that occurs exactly once, that block is the target.
+    decl = re.match(r"\s*((?:async\s+def|def|class)\s+\w+)", probe_lines[0])
+    if decl:
+        signature = decl.group(1)
+        hits = [
+            i for i, line in enumerate(file_lines)
+            if re.match(r"\s*" + re.escape(signature) + r"\b", line)
+        ]
+        if len(hits) == 1:
+            i = hits[0]
+            indent = len(file_lines[i]) - len(file_lines[i].lstrip())
+            # The block runs until the next line at the same or lower indent.
+            end_i = i + 1
+            while end_i < len(file_lines):
+                line = file_lines[end_i]
+                if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+                    break
+                end_i += 1
+            start = offsets[i]
+            end = offsets[end_i - 1] + len(file_lines[end_i - 1])
+            return (start, end), f" [matched by declaration '{signature}']"
+
     return None, ""
+
+
+def _as_line_number(value) -> int | None:
+    """Coerce a line number the model sent as text/float. None if unusable.
+
+    JSON schemas say "integer", but small models routinely emit "2" or 2.0.
+    Rejecting those turned a valid edit into a crash the model could not
+    interpret, so they are accepted instead.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                num = float(text)
+            except ValueError:
+                return None
+            return int(num) if num.is_integer() else None
+    return None
 
 
 def edit_file(
@@ -220,11 +274,36 @@ def edit_file(
         if not filepath.is_file():
             return f"Error: Not a file: {path}"
 
+        # The model may omit new_string entirely when deleting lines.
+        new_string = "" if new_string is None else str(new_string)
+        old_string = "" if old_string is None else str(old_string)
+
+        raw_start, raw_end = start_line, end_line
+        start_line = _as_line_number(raw_start)
+        end_line = _as_line_number(raw_end)
+        if start_line is None and raw_start not in (None, "", 0):
+            return (
+                f"Error: start_line must be a line number, got {raw_start!r}. "
+                "Use the numbers printed by read_file."
+            )
+        if end_line is None and raw_end not in (None, "", 0):
+            return (
+                f"Error: end_line must be a line number, got {raw_end!r}. "
+                "Use the numbers printed by read_file."
+            )
+
         content, used_encoding = _read_text(filepath)
 
         # Line addressing is exact by construction: no memorising, no fuzzy
         # matching, no ambiguity. read_file prints these very numbers.
         if start_line:
+            if old_string:
+                # Both addressing modes at once is ambiguous; line numbers win,
+                # but say so rather than silently ignoring old_string.
+                print(
+                    f"  [edit_file: start_line and old_string both given for "
+                    f"{path}; using line numbers]"
+                )
             return _replace_lines(
                 filepath, content, used_encoding, path,
                 start_line, end_line or start_line, new_string,

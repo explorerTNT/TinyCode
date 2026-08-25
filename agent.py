@@ -218,6 +218,10 @@ def _looks_done(text: str) -> bool:
 TOOL_RESULT_CAP = 4000
 KEEP_FULL_TOOL_RESULTS = 5
 
+# The system prompt asks for one call per step; this caps the damage when the
+# model ignores that and returns a whole batch.
+MAX_CALLS_PER_ROUND = 3
+
 
 def _clear_old_tool_results(messages: list) -> list:
     """Drop raw tool output beyond the last N calls, keeping the fact of the call.
@@ -867,8 +871,19 @@ class TinyCodeAgent:
             )
         except subprocess.TimeoutExpired:
             return "AUTO-VERIFY FAILED (runtime): script ran past the 15s limit — check for an infinite loop."
+        if proc.returncode == 0 and not (proc.stdout or "").strip():
+            # Exit code 0 is not proof of success: a logic bug (a mismatched
+            # membership test, an off-by-one range) commonly yields a script
+            # that runs fine and prints nothing at all.
+            return (
+                "AUTO-VERIFY FAILED (no output): the script exited cleanly but "
+                "printed nothing. A program that is supposed to display "
+                "something has a logic bug - check your conditions and loop "
+                "ranges, especially any `in` test against a list whose items "
+                "are a different shape than what you compare."
+            )
         if proc.returncode != 0:
-            out = [l for l in (proc.stderr or proc.stdout).splitlines() if l.strip()][-8:]
+            out = _summarize_traceback(proc.stderr or proc.stdout)
             return (
                 "AUTO-VERIFY FAILED (runtime): the script crashed on execution. "
                 "Fix the error below:\n" + "\n".join(out)
@@ -997,6 +1012,15 @@ class TinyCodeAgent:
                 last_content_norm = None
                 repeat_count = 0
                 text_only_rounds = 0
+                if len(tc_list) > MAX_CALLS_PER_ROUND:
+                    # A confused model emits dozens of calls in one reply; the
+                    # inner loop then burns them all inside a single round and
+                    # every per-round guard is bypassed.
+                    print(
+                        f"  [{len(tc_list)} tool calls in one reply, keeping "
+                        f"the first {MAX_CALLS_PER_ROUND}]"
+                    )
+                    tc_list = tc_list[:MAX_CALLS_PER_ROUND]
                 for tc in tc_list:
                     try:
                         name = tc["function"]["name"]
@@ -1047,10 +1071,14 @@ class TinyCodeAgent:
                     except Exception:
                         arg_key = str(args)
                     recent_tools.append((name, arg_key))
-                    if len(recent_tools) > 6:
+                    if len(recent_tools) > 8:
                         recent_tools.pop(0)
                     same = [t for t in recent_tools if t == (name, arg_key)]
-                    if len(same) >= 3:
+                    # Varying the arguments each time (a new search query, a
+                    # new URL) slipped past the identical-call check, so the
+                    # model could loop on a tool indefinitely.
+                    same_tool = [t for t in recent_tools if t[0] == name]
+                    if len(same) >= 3 or len(same_tool) >= 6:
                         print("  [repeating same tool, recovery prompt]")
                         seen = []
                         for e in recent_errors[-5:]:
@@ -1060,11 +1088,12 @@ class TinyCodeAgent:
                         self._add_msg({
                             "role": "user",
                             "content": (
-                                "You keep calling the same tool with the same arguments "
-                                "and it keeps failing. Errors you got:\n"
+                                f"You have called `{name}` over and over without making "
+                                "progress. Errors you got:\n"
                                 f"{err_block}\n"
-                                "Do NOT repeat the same call. Re-examine the situation, "
-                                "change your approach, or use a different tool."
+                                f"STOP using `{name}`. You already have everything you "
+                                "need: write the code yourself from your own knowledge, "
+                                "then run it. Do not search the web for this task."
                             ),
                         })
                         recent_tools.clear()
@@ -1485,6 +1514,42 @@ class TinyCodeAgent:
         print()
         self._process_turn()
         print()
+
+
+def _summarize_traceback(text: str, keep: int = 8) -> list[str]:
+    """Trim a traceback to the frames that actually help.
+
+    A RecursionError produces ~1000 identical frames; keeping the tail alone
+    shows only the repeats and hides both the entry point and the real error.
+    """
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    if not lines:
+        return []
+
+    deduped = []
+    seen_frames = {}
+    for line in lines:
+        stripped = line.strip()
+        # Collapse a frame that repeats (recursive call) after a few samples.
+        if stripped.startswith("File \""):
+            seen_frames[stripped] = seen_frames.get(stripped, 0) + 1
+            if seen_frames[stripped] > 2:
+                continue
+        deduped.append(line)
+
+    repeated = [f for f, n in seen_frames.items() if n > 2]
+    head = deduped[:3]
+    tail = deduped[-keep:]
+    out = head + (["  ..."] if len(deduped) > len(head) + keep else []) + tail
+    # Drop the overlap when the traceback is short enough to fit whole.
+    if len(deduped) <= len(head) + keep:
+        out = deduped
+    if repeated:
+        out.append(
+            f"[{len(repeated)} frame(s) repeated many times - this is infinite "
+            "recursion, not a one-off error]"
+        )
+    return out
 
 
 def _count_plan_steps(plan: str) -> int:
