@@ -2,3 +2,5 @@ openai>=1.0
 json_repair>=0.30
 duckduckgo_search>=6.0
 requests>=2.31
+textual>=0.80
+rich>=13.0

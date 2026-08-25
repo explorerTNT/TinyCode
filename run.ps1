@@ -14,7 +14,7 @@ $AgentPath = Join-Path $ScriptDir "agent.py"
 if (-not (Test-Path -LiteralPath $VenvPath)) {
     Write-Host "[tiny-code] Creating virtual environment..." -ForegroundColor Yellow
     python -m venv $VenvPath
-    & (Join-Path $VenvPath "Scripts\python") -m pip install --quiet openai json_repair duckduckgo_search requests
+    & (Join-Path $VenvPath "Scripts\python") -m pip install --quiet openai json_repair duckduckgo_search requests textual rich
 }
 
 $Python = Join-Path $VenvPath "Scripts\python"
