@@ -1,4 +1,0 @@
-openai>=1.0
-json_repair>=0.30
-duckduckgo_search>=6.0
-requests>=2.31
