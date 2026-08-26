@@ -21,8 +21,11 @@ PS_HELP = (
     "`python3` = `python`, `pip3` = `pip`."
 )
 
+MAX_STDOUT = 10000
+MAX_STDERR = 5000
 
-def run_bash(command: str, timeout: int = 30) -> str:
+
+def run_bash(command: str, timeout: int = 30, cwd: str = None) -> str:
     """Run a shell command on the user's machine and return the output.
     Use this for: git operations, running builds, executing tests, file operations.
     Be careful: this can modify the system.
@@ -30,6 +33,7 @@ def run_bash(command: str, timeout: int = 30) -> str:
     Args:
         command: The shell command to execute (PowerShell syntax on Windows)
         timeout: Maximum execution time in seconds (default 30, max 120)
+        cwd: Directory to run in. Defaults to the process working directory.
     """
     try:
         timeout = int(timeout)
@@ -38,6 +42,16 @@ def run_bash(command: str, timeout: int = 30) -> str:
     # Bound outside the try block: referencing it from the TimeoutExpired
     # handler raised UnboundLocalError when the failure happened earlier.
     safe_timeout = max(1, min(timeout, 120))
+
+    if command is None or not str(command).strip():
+        return "Error: empty command"
+    command = str(command)
+
+    # An explicit cwd is passed by the agent instead of mutating the process
+    # working directory, which is global state shared with the TUI thread.
+    work_dir = cwd or os.getcwd()
+    if not os.path.isdir(work_dir):
+        return f"Error: working directory does not exist: {work_dir}"
 
     try:
         if sys.platform == "win32":
@@ -50,7 +64,7 @@ def run_bash(command: str, timeout: int = 30) -> str:
             # PowerShell is the documented shell for this agent, and cmd.exe
             # mangles nested quotes: `python -c "import x"` reaches Python as
             # a broken string literal. Route everything through PowerShell.
-            shell_cmd = ["powershell", "-NoProfile", "-Command", command]
+            shell_cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", command]
         else:
             shell_cmd = ["sh", "-c", command]
 
@@ -61,23 +75,27 @@ def run_bash(command: str, timeout: int = 30) -> str:
             encoding="utf-8",
             errors="replace",
             timeout=safe_timeout,
-            cwd=os.getcwd(),
+            cwd=work_dir,
+            # A command that waits on stdin would otherwise hang until the
+            # timeout with no indication of why.
+            stdin=subprocess.DEVNULL,
         )
 
         output_parts = []
         if result.stdout:
-            output_parts.append(result.stdout.rstrip()[:10000])
+            stdout = result.stdout.rstrip()
+            if len(stdout) > MAX_STDOUT:
+                stdout = stdout[:MAX_STDOUT] + "\n(truncated)"
+            output_parts.append(stdout)
         if result.stderr:
             err = result.stderr.rstrip()
             if result.returncode != 0:
                 lines = err.splitlines()
                 if len(lines) > 15:
-                    tail = lines[-15:]
-                    err = "(truncated)\n" + "\n".join(tail)
+                    err = "(truncated)\n" + "\n".join(lines[-15:])
                 elif len(err) > 2500:
-                    err = err[-2500:].lstrip()
-                    err = "(truncated)\n" + err
-            output_parts.append(f"--- stderr ---\n{err[:5000]}")
+                    err = "(truncated)\n" + err[-2500:].lstrip()
+            output_parts.append(f"--- stderr ---\n{err[:MAX_STDERR]}")
 
         if not output_parts:
             if re.search(r"\bpython\b.*\.py\b", command):
@@ -94,7 +112,7 @@ def run_bash(command: str, timeout: int = 30) -> str:
 
         if result.returncode != 0:
             output = f"Exit code: {result.returncode}\n{output}"
-            if "Traceback" in result.stderr:
+            if "Traceback" in (result.stderr or ""):
                 output += "\n\nHINT: The script crashed. Read the error, fix the bug in the .py file, then re-run."
 
         return output
@@ -142,13 +160,39 @@ def _sanitize_cmd(command: str) -> str:
     cmd = re.sub(
         r"^\s*cd\s+(?:\.|[\"']\.[\"'])\s*(?:&&|;)\s*", "", cmd
     )
-    cmd = re.sub(r"\bpython3(?:\.\d+)?\b", "python", cmd)
-    cmd = re.sub(r"\bpip3\b", "pip", cmd)
+    cmd = _sub_outside_quotes(r"\bpython3(?:\.\d+)?\b", "python", cmd)
+    cmd = _sub_outside_quotes(r"\bpip3\b", "pip", cmd)
     cmd = re.sub(r"\s*2>\s*/dev/null", "", cmd)
     cmd = re.sub(r"\s*1?>\s*/dev/null", "", cmd)
     cmd = re.sub(r"\s+2>&1\s*\|\s*cat\b", "", cmd)
     cmd = _squeeze_spaces_outside_quotes(cmd)
     return cmd.strip().strip(";").strip()
+
+
+def _sub_outside_quotes(pattern: str, repl: str, cmd: str) -> str:
+    """Apply a substitution only to the unquoted parts of a command.
+
+    Rewriting inside quotes corrupts the user's own data: a commit message or
+    a here-string that legitimately mentions "python3" must survive intact.
+    """
+    out = []
+    buf = []
+    quote = None
+    for ch in cmd:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            out.append(re.sub(pattern, repl, "".join(buf)))
+            buf = []
+            quote = ch
+            out.append(ch)
+            continue
+        buf.append(ch)
+    out.append(re.sub(pattern, repl, "".join(buf)))
+    return "".join(out)
 
 
 def _squeeze_spaces_outside_quotes(cmd: str) -> str:
