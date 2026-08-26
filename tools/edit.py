@@ -1,45 +1,34 @@
+import difflib
+import re
 from pathlib import Path
 
+from .textfile import (
+    apply_newlines,
+    dominant_newline,
+    join_lines,
+    normalize,
+    read_text,
+    split_lines,
+    write_text,
+)
 
-def _read_text(filepath: Path) -> tuple[str, str]:
-    """Read a text file, preserving its original encoding for later write-back."""
-    for encoding in ("utf-8", "utf-8-sig", "cp1251"):
-        try:
-            with open(filepath, "r", encoding=encoding, newline="") as f:
-                return f.read(), encoding
-        except UnicodeDecodeError:
-            continue
-    with open(filepath, "r", encoding="utf-8", errors="replace", newline="") as f:
-        return f.read(), "utf-8"
-
-
-def _match_newlines(text: str, content: str) -> str:
-    """Re-encode `text` with the newline style the file already uses.
-
-    The model always emits \\n. Splicing that into a CRLF file leaves mixed
-    endings, which then breaks the next old_string match on the same file.
-    """
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    if "\r\n" in content:
-        return normalized.replace("\n", "\r\n")
-    return normalized
+# A fuzzy match is only accepted when it is both strong and clearly better than
+# the runner-up. These thresholds are deliberately strict: applying an edit to
+# the wrong block corrupts the file silently, which is far worse than returning
+# an error the model can recover from.
+FUZZY_MIN_RATIO = 0.94
+FUZZY_MIN_MARGIN = 0.08
 
 
-def _near_miss(content: str, old_string: str, max_hits: int = 3) -> str:
+def _near_miss(lines: list[str], old_string: str, max_hits: int = 3) -> str:
     """Show real lines resembling a failed old_string.
 
     A 2B model retypes a line from memory and gets the spacing or a digit
     wrong, then has no way to see what the file really says.
     """
-    import re
-
-    import difflib
-
     probe_lines = [ln.strip() for ln in old_string.strip().split("\n") if ln.strip()]
     if not probe_lines:
         return ""
-
-    lines = content.split("\n")
 
     # Score every file line against every probe line and keep the best matches.
     # Ranking by *similarity* rather than by rarity is what matters: an earlier
@@ -72,9 +61,7 @@ def _near_miss(content: str, old_string: str, max_hits: int = 3) -> str:
         boosted = dict(scored)
         span = len(probe_lines)
         for ln in scored:
-            neighbours = sum(
-                scored.get(ln + off, 0) for off in range(1, span + 1)
-            )
+            neighbours = sum(scored.get(ln + off, 0) for off in range(1, span + 1))
             boosted[ln] = scored[ln] + neighbours
         scored = boosted
 
@@ -83,6 +70,25 @@ def _near_miss(content: str, old_string: str, max_hits: int = 3) -> str:
     if len(ranked) > max_hits:
         out.append(f"  ... and {len(ranked) - max_hits} more")
     return "\n".join(out)
+
+
+def _write_lines(
+    filepath: Path,
+    lines: list[str],
+    newline: str,
+    trailing: bool,
+    encoding: str,
+    original_len: int,
+    shown_path: str,
+    detail: str,
+) -> str:
+    out = join_lines(lines, newline, trailing)
+    write_text(filepath, out, encoding)
+    diff = len(out) - original_len
+    return (
+        f"Successfully edited {shown_path} "
+        f"({'+' if diff >= 0 else ''}{diff} bytes, {detail})"
+    )
 
 
 def _replace_lines(
@@ -95,15 +101,15 @@ def _replace_lines(
     new_text: str,
 ) -> str:
     """Replace an inclusive 1-based line range. Deterministic, no guessing."""
-    newline = "\r\n" if "\r\n" in content else "\n"
-    lines = content.split(newline)
-    # A trailing newline yields a final empty element that is not a real line.
-    trailing = lines and lines[-1] == ""
-    if trailing:
-        lines = lines[:-1]
-
+    lines, trailing = split_lines(content)
+    newline = dominant_newline(content)
     total = len(lines)
-    if start < 1 or start > total:
+
+    if total == 0:
+        return f"Error: {shown_path} is empty, there is no line {start} to replace"
+    if start < 1:
+        return f"Error: start_line must be 1 or greater, got {start}"
+    if start > total:
         return f"Error: start_line {start} is out of range (file has {total} lines)"
     if end < start:
         return f"Error: end_line {end} is before start_line {start}"
@@ -112,114 +118,113 @@ def _replace_lines(
 
     replaced = lines[start - 1:end]
     # The model may send \r\n, \n or a mix regardless of what the file uses.
-    # Splitting on "\n" alone leaves a stray \r on every line, which then gets
-    # joined with the file's own newline and produces "\r\r\n".
-    new_text = new_text.replace("\r\n", "\n").replace("\r", "\n")
-    new_lines = new_text.split("\n") if new_text else []
-    # Strip a trailing blank the model may append to its replacement text.
-    if len(new_lines) > 1 and new_lines[-1] == "":
-        new_lines = new_lines[:-1]
+    new_lines, _ = split_lines(normalize(new_text)) if new_text else ([], False)
 
     updated = lines[:start - 1] + new_lines + lines[end:]
-    out = newline.join(updated) + (newline if trailing else "")
-
-    with open(filepath, "w", encoding=encoding, newline="") as f:
-        f.write(out)
-
-    diff = len(out) - len(content)
-    return (
-        f"Successfully edited {shown_path} "
-        f"({'+' if diff >= 0 else ''}{diff} bytes, "
-        f"lines {start}-{end} replaced: {len(replaced)} -> {len(new_lines)})"
+    return _write_lines(
+        filepath, updated, newline, trailing, encoding, len(content), shown_path,
+        f"lines {start}-{end} replaced: {len(replaced)} -> {len(new_lines)}",
     )
 
 
-def _locate_block(content: str, probe: str) -> tuple[tuple[int, int] | None, str]:
-    """Find the character span in `content` that `probe` was meant to match.
+def _locate_block(lines: list[str], probe: str) -> tuple[tuple[int, int] | None, str, str]:
+    """Find the line range in ``lines`` that ``probe`` was meant to match.
 
     Small models reproduce code from memory and get indentation, trailing
     whitespace or a character or two wrong. Requiring a byte-exact match turns
     every such slip into a guessing loop, so match in widening steps and stop
     at the first level that gives a single unambiguous answer.
 
-    Returns ((start, end), note) or (None, "").
+    Returns ((start_idx, end_idx_exclusive), note, ambiguity_reason).
+    A non-empty reason means a candidate existed but was rejected as unsafe,
+    which lets the caller explain *why* instead of just saying "not found".
     """
-    import difflib
-    import re
-
-    probe_lines = probe.strip("\n").split("\n")
-    file_lines = content.split("\n")
+    probe_lines = normalize(probe).strip("\n").split("\n")
     span = len(probe_lines)
-    if span == 0 or span > len(file_lines):
-        return None, ""
-
-    # Character offset of the start of each line, so a line range can be
-    # translated back into an exact slice of the original text.
-    offsets, pos = [], 0
-    for line in file_lines:
-        offsets.append(pos)
-        pos += len(line) + 1
-
-    def span_bounds(i: int) -> tuple[int, int]:
-        start = offsets[i]
-        end = offsets[i + span - 1] + len(file_lines[i + span - 1])
-        return start, end
+    if span == 0 or span > len(lines):
+        return None, "", ""
 
     stripped_probe = [ln.strip() for ln in probe_lines]
 
     # Level 1: identical once leading/trailing whitespace is ignored.
     exact = [
         i
-        for i in range(len(file_lines) - span + 1)
-        if [ln.strip() for ln in file_lines[i:i + span]] == stripped_probe
+        for i in range(len(lines) - span + 1)
+        if [ln.strip() for ln in lines[i:i + span]] == stripped_probe
     ]
     if len(exact) == 1:
-        return span_bounds(exact[0]), " [matched ignoring indentation]"
+        return (exact[0], exact[0] + span), " [matched ignoring indentation]", ""
     if len(exact) > 1:
-        return None, ""
+        found = ", ".join(str(i + 1) for i in exact[:5])
+        return None, "", (
+            f"the text appears {len(exact)} times (lines {found}). "
+            "Use start_line/end_line to say which one you mean."
+        )
 
     # Level 2: near-identical text. The threshold is deliberately high so an
     # edit is never applied to a block the model did not mean.
     joined_probe = "\n".join(stripped_probe)
     best_i, best_ratio, runner_up = -1, 0.0, 0.0
-    for i in range(len(file_lines) - span + 1):
-        candidate = "\n".join(ln.strip() for ln in file_lines[i:i + span])
+    for i in range(len(lines) - span + 1):
+        candidate = "\n".join(ln.strip() for ln in lines[i:i + span])
         ratio = difflib.SequenceMatcher(None, joined_probe, candidate).ratio()
         if ratio > best_ratio:
             best_i, runner_up, best_ratio = i, best_ratio, ratio
         elif ratio > runner_up:
             runner_up = ratio
 
-    # Require both a strong match and a clear winner.
-    if best_ratio >= 0.92 and best_ratio - runner_up >= 0.05:
-        return span_bounds(best_i), f" [fuzzy match, {best_ratio:.0%} similar]"
+    if best_ratio >= FUZZY_MIN_RATIO and best_ratio - runner_up >= FUZZY_MIN_MARGIN:
+        return (best_i, best_i + span), f" [fuzzy match, {best_ratio:.0%} similar]", ""
+
+    # A strong-but-ambiguous match is the dangerous case: two near-identical
+    # blocks (an overloaded method, a repeated test case). Refusing here and
+    # naming the line is what keeps the edit from landing in the wrong one.
+    if best_ratio >= FUZZY_MIN_RATIO:
+        return None, "", (
+            f"two or more blocks look almost identical (best match at line "
+            f"{best_i + 1}, {best_ratio:.0%} similar, with a near-tie). "
+            "Use start_line/end_line to disambiguate."
+        )
 
     # Level 3: anchor on a declaration. Small models misremember a signature
     # ("def is_safe(board, r, n)" for "...r, c"), which drops similarity below
-    # any safe threshold even though the target is unambiguous. If the probe
-    # starts at a def/class that occurs exactly once, that block is the target.
+    # any safe threshold even though the target is unambiguous.
     decl = re.match(r"\s*((?:async\s+def|def|class)\s+\w+)", probe_lines[0])
     if decl:
         signature = decl.group(1)
         hits = [
-            i for i, line in enumerate(file_lines)
+            i for i, line in enumerate(lines)
             if re.match(r"\s*" + re.escape(signature) + r"\b", line)
         ]
         if len(hits) == 1:
             i = hits[0]
-            indent = len(file_lines[i]) - len(file_lines[i].lstrip())
+            indent = len(lines[i]) - len(lines[i].lstrip())
             # The block runs until the next line at the same or lower indent.
             end_i = i + 1
-            while end_i < len(file_lines):
-                line = file_lines[end_i]
+            while end_i < len(lines):
+                line = lines[end_i]
                 if line.strip() and (len(line) - len(line.lstrip())) <= indent:
                     break
                 end_i += 1
-            start = offsets[i]
-            end = offsets[end_i - 1] + len(file_lines[end_i - 1])
-            return (start, end), f" [matched by declaration '{signature}']"
+            # Replacing a 40-line function because the model sent a 3-line
+            # probe destroys code it never looked at. Only accept the anchor
+            # when the block is close to the size the probe implies.
+            block_span = end_i - i
+            if block_span > span * 2 + 5:
+                return None, "", (
+                    f"'{signature}' at line {i + 1} spans {block_span} lines but "
+                    f"you supplied {span}. Read the file and edit by "
+                    "start_line/end_line so nothing outside your intent is lost."
+                )
+            return (i, end_i), f" [matched by declaration '{signature}']", ""
+        if len(hits) > 1:
+            found = ", ".join(str(i + 1) for i in hits[:5])
+            return None, "", (
+                f"'{signature}' is declared {len(hits)} times (lines {found}). "
+                "Use start_line/end_line to pick one."
+            )
 
-    return None, ""
+    return None, "", ""
 
 
 def _as_line_number(value) -> int | None:
@@ -292,7 +297,7 @@ def edit_file(
                 "Use the numbers printed by read_file."
             )
 
-        content, used_encoding = _read_text(filepath)
+        content, used_encoding = read_text(filepath)
 
         # Line addressing is exact by construction: no memorising, no fuzzy
         # matching, no ambiguity. read_file prints these very numbers.
@@ -315,88 +320,76 @@ def edit_file(
                 "or old_string."
             )
 
-        # The model always emits \n, but the file on disk may use CRLF. Match
-        # against a normalised copy and translate offsets back, otherwise no
-        # multi-line edit can ever succeed on a Windows-style file.
-        crlf = "\r\n" in content
-        if crlf and "\r\n" not in old_string:
-            content_cmp = content.replace("\r\n", "\n")
-            if content_cmp.count(old_string) == 1:
-                # new_string must be LF here as well: the whole buffer is
-                # converted to CRLF below, so any \r left inside it would
-                # become \r\r\n.
-                new_lf = new_string.replace("\r\n", "\n").replace("\r", "\n")
-                new_cmp = content_cmp.replace(old_string, new_lf, 1)
-                new_content = new_cmp.replace("\n", "\r\n")
-                with open(filepath, "w", encoding=used_encoding, newline="") as f:
-                    f.write(new_content)
-                diff = len(new_content) - len(content)
-                return (
-                    f"Successfully edited {path} "
-                    f"({'+' if diff >= 0 else ''}{diff} bytes, "
-                    f"{old_string.count(chr(10)) + 1} lines changed)"
-                )
+        lines, trailing = split_lines(content)
+        newline = dominant_newline(content)
 
-        count = content.count(old_string)
-        if count == 0:
-            # Exact match failed. Rather than making the model retype the text
-            # from memory (which is what it is bad at), locate the block by
-            # tolerating the things it actually gets wrong: indentation,
-            # trailing spaces and small typos. Only give up if that is
-            # ambiguous or too weak a match.
-            located, note = _locate_block(content, old_string)
-            if located is not None:
-                start, end = located
-                new_content = content[:start] + _match_newlines(new_string, content) + content[end:]
-                with open(filepath, "w", encoding=used_encoding, newline="") as f:
-                    f.write(new_content)
-                diff = len(new_content) - len(content)
-                return (
-                    f"Successfully edited {path} "
-                    f"({'+' if diff >= 0 else ''}{diff} bytes, "
-                    f"{old_string.count(chr(10)) + 1} lines changed){note}"
-                )
+        # All matching happens on a normalised copy so a CRLF file behaves
+        # exactly like an LF one; the file's own style is restored on write.
+        norm_content = normalize(content)
+        norm_old = normalize(old_string)
+        norm_new = normalize(new_string)
 
-            short = old_string[:50].replace("\n", "\\n")
-            hint = _near_miss(content, old_string)
-            msg = f"Error: Could not find '{short}...' in {path}"
-            if hint:
-                msg += (
-                    "\nClosest lines in the file:\n" + hint
-                    + "\nUse start_line/end_line with those numbers instead of "
-                      "retyping the text."
+        count = norm_content.count(norm_old)
+
+        if count == 1:
+            if norm_old == norm_new:
+                # old_string WAS found, so the only way the file ends up
+                # unchanged is new_string being identical. Saying "not found"
+                # here is a lie that sends the model hunting for a phantom bug.
+                return (
+                    "No changes made: old_string and new_string are identical. "
+                    "To fix a typo, new_string must differ from old_string."
                 )
-            else:
-                msg += (
-                    "\nRun read_file first, then edit by start_line/end_line "
-                    "instead of matching text."
-                )
-            return msg
+            new_norm_content = norm_content.replace(norm_old, norm_new, 1)
+            out = apply_newlines(new_norm_content, newline)
+            write_text(filepath, out, used_encoding)
+            diff = len(out) - len(content)
+            return (
+                f"Successfully edited {path} "
+                f"({'+' if diff >= 0 else ''}{diff} bytes, "
+                f"{norm_old.count(chr(10)) + 1} lines changed)"
+            )
+
         if count > 1:
-            short = old_string[:50].replace("\n", "\\n")
+            short = norm_old[:50].replace("\n", "\\n")
             return (
                 f"Error: Found {count} occurrences of '{short}...' in {path}. "
-                "Provide more surrounding context to make old_string unique."
+                "Provide more surrounding context to make old_string unique, "
+                "or use start_line/end_line."
             )
 
-        new_content = content.replace(old_string, _match_newlines(new_string, content), 1)
+        # Exact match failed. Rather than making the model retype the text
+        # from memory (which is what it is bad at), locate the block by
+        # tolerating the things it actually gets wrong: indentation,
+        # trailing spaces and small typos. Only give up if that is
+        # ambiguous or too weak a match.
+        located, note, reason = _locate_block(lines, norm_old)
+        if located is not None:
+            start_i, end_i = located
+            new_lines, _ = split_lines(norm_new) if norm_new else ([], False)
+            updated = lines[:start_i] + new_lines + lines[end_i:]
+            return _write_lines(
+                filepath, updated, newline, trailing, used_encoding, len(content), path,
+                f"lines {start_i + 1}-{end_i} replaced: {end_i - start_i} -> {len(new_lines)}",
+            ) + note
 
-        if new_content == content:
-            # old_string WAS found (count == 1 above), so the only way the file
-            # is unchanged is new_string being identical. Saying "not found"
-            # here is a lie that sends the model hunting for a phantom bug.
-            return (
-                "No changes made: old_string and new_string are identical. "
-                "To fix a typo, new_string must differ from old_string."
+        short = norm_old[:50].replace("\n", "\\n")
+        msg = f"Error: Could not find '{short}...' in {path}"
+        if reason:
+            msg += f"\nReason: {reason}"
+            return msg
+        hint = _near_miss(lines, norm_old)
+        if hint:
+            msg += (
+                "\nClosest lines in the file:\n" + hint
+                + "\nUse start_line/end_line with those numbers instead of "
+                  "retyping the text."
             )
-
-        with open(filepath, "w", encoding=used_encoding, newline="") as f:
-            f.write(new_content)
-
-        original_len = len(content)
-        new_len = len(new_content)
-        diff = new_len - original_len
-
-        return f"Successfully edited {path} ({'+' if diff >= 0 else ''}{diff} bytes, {old_string.count(chr(10)) + 1} lines changed)"
+        else:
+            msg += (
+                "\nRun read_file first, then edit by start_line/end_line "
+                "instead of matching text."
+            )
+        return msg
     except Exception as e:
         return f"Error editing file: {e}"

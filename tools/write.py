@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from .textfile import apply_newlines, dominant_newline, read_text, write_text
+
 
 def _syntax_error(source: str) -> str | None:
     """Return a short description of a Python syntax error, or None if valid."""
@@ -26,7 +28,10 @@ def write_file(path: str, content: str) -> str:
         content: The full content to write to the file
     """
     try:
+        content = "" if content is None else str(content)
         filepath = Path(path).resolve()
+        if filepath.exists() and filepath.is_dir():
+            return f"Error: {path} is a directory, not a file"
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         # A small model often stops mid-expression while still emitting valid
@@ -42,12 +47,21 @@ def write_file(path: str, content: str) -> str:
                     "that is complete and runnable, then extend it with edit_file."
                 )
 
-        # newline="" disables Python's automatic \n -> \r\n translation.
-        # Without it the file gets CRLF while the model keeps sending \n in
-        # edit_file(old_string=...), so no multi-line edit can ever match.
-        with open(filepath, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
+        # Overwriting an existing CRLF file with the model's LF-only output
+        # rewrites every line in the diff. Preserve whatever the file already
+        # used; a brand new file gets LF.
+        newline = "\n"
+        if filepath.exists():
+            try:
+                existing, _ = read_text(filepath)
+                if existing:
+                    newline = dominant_newline(existing)
+            except OSError:
+                pass
 
-        return f"Successfully wrote {len(content)} bytes to {filepath}"
+        out = apply_newlines(content, newline)
+        write_text(filepath, out, "utf-8")
+
+        return f"Successfully wrote {len(out)} bytes to {filepath}"
     except Exception as e:
         return f"Error writing file: {e}"

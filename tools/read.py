@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from .glob import suggest_files
+from .textfile import read_text, split_lines
 
 
 BINARY_EXTS = {
@@ -37,7 +38,11 @@ def read_file(path: str, offset: int = 1, limit: int = 2000) -> str:
         filepath = Path(path).resolve()
         if not filepath.exists():
             msg = f"Error: File not found: {path}"
-            candidates = suggest_files(path, filepath.parent if filepath.parent.exists() else Path.cwd())
+            # Suggestions are scoped to the file's intended parent. Falling
+            # back to cwd used to trigger a full recursive scan of whatever
+            # directory the process happened to be in.
+            parent = filepath.parent
+            candidates = suggest_files(path, parent) if parent.is_dir() else []
             if candidates:
                 msg += " Did you mean:\n" + "\n".join(f"  {c}" for c in candidates)
             return msg
@@ -66,22 +71,30 @@ def read_file(path: str, offset: int = 1, limit: int = 2000) -> str:
                 "Use search_files to find the relevant part, then read with offset/limit."
             )
 
-        total = 0
-        lines = []
-        cap = min(limit, 5000)
+        offset = _as_int(offset, 1)
+        limit = _as_int(limit, 2000)
+
+        # Shared splitting keeps these line numbers identical to the ones
+        # edit_file addresses. Reading in text mode here (and raw there) used
+        # to make the two disagree on any file with mixed line endings, so an
+        # edit landed on the wrong line.
+        content, _ = read_text(filepath)
+        all_lines, _ = split_lines(content)
+        total = len(all_lines)
+
+        cap = max(1, min(limit, 5000))
         start = max(0, offset - 1)
         end = start + cap
 
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                total += 1
-                if start < total <= end:
-                    if len(line) > MAX_LINE_CHARS:
-                        line = line[:MAX_LINE_CHARS] + " ... [line truncated]\n"
-                    lines.append(f"{total}: {line}")
-
         if start >= total:
             return f"--- {filepath} (offset {offset} past end, {total} lines total) ---\n"
+
+        lines = []
+        for n in range(start, min(end, total)):
+            line = all_lines[n]
+            if len(line) > MAX_LINE_CHARS:
+                line = line[:MAX_LINE_CHARS] + " ... [line truncated]"
+            lines.append(f"{n + 1}: {line}\n")
 
         info = f"--- {filepath} (lines {start + 1}-{min(end, total)} of {total}) ---\n"
         if end < total:
@@ -90,6 +103,18 @@ def read_file(path: str, offset: int = 1, limit: int = 2000) -> str:
         return info + "".join(lines)
     except Exception as e:
         return f"Error reading file: {e}"
+
+
+def _as_int(value, default: int) -> int:
+    """Small models send "1" or 1.0 where the schema says integer."""
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 def _fmt_size(size: int) -> str:
