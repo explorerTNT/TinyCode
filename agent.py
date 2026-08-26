@@ -1,3 +1,4 @@
+import ast
 import json
 import inspect
 import re
@@ -17,6 +18,7 @@ from system_prompt import SYSTEM_PROMPT, PLAN_MODE_PROMPT
 from tools import get_tools
 from permissions import PermissionManager
 from context import count_message_tokens
+from sandbox import SandboxError, check_command, is_within, resolve_in_workspace
 from tools.glob import suggest_files
 
 
@@ -64,19 +66,32 @@ def _safe_json_loads(text: str):
         return None
 
 
-# Substrings that make an auto-run verification unsafe to execute.
-_VERIFY_UNSAFE = (
-    "os.system", "subprocess", "shutil.rmtree", "os.remove",
-    "os.rmdir", "os.unlink", "os.rename", "eval(", "exec(",
-)
+# Modules whose mere import makes an auto-run verification unsafe. Checked
+# through the AST rather than by substring: `"subprocess" in src` was trivially
+# bypassed by `__import__("subprocess")`, an alias, or a split string literal,
+# and it also produced false positives on the word appearing in a comment.
+_VERIFY_UNSAFE_MODULES = {
+    "subprocess", "shutil", "socket", "ctypes", "multiprocessing",
+    "urllib", "urllib2", "requests", "http", "ftplib", "telnetlib",
+    "smtplib", "pickle", "shelve", "marshal", "winreg", "_winreg",
+    "webbrowser", "signal", "pty", "tempfile", "glob", "pathlib",
+}
 
-# Regex patterns a critic pass blocks before a bash command runs.
-_CRITIC_BASH_DANGEROUS = (
-    r"rm\s+-rf\s+/", r"rm\s+-r\s+/", r"rm\s+-rf\s+~", r"rm\s+-r\s+~",
-    r"format\s+[a-z]:", r"mkfs", r":\(\)\{", r"dd\s+if=",
-    r"curl\s+.*\|\s*(sh|bash)", r"wget\s+.*\|\s*(sh|bash)",
-    r"del\s+/[fsq]", r"rmdir\s+/s",
-)
+# Attribute calls that touch the filesystem or spawn a process.
+_VERIFY_UNSAFE_ATTRS = {
+    "system", "popen", "remove", "unlink", "rmdir", "removedirs",
+    "rename", "renames", "replace", "truncate", "chmod", "chown",
+    "rmtree", "move", "copy", "copy2", "copytree", "kill", "abort",
+    "execv", "execve", "execl", "execlp", "execvp", "spawnv", "spawnl",
+    "fork", "write_text", "write_bytes", "mkdir", "touch",
+}
+
+# Builtins that let generated code reach anything at all.
+_VERIFY_UNSAFE_NAMES = {
+    "eval", "exec", "compile", "__import__", "open", "input",
+    "globals", "locals", "vars", "getattr", "setattr", "delattr",
+    "memoryview", "breakpoint",
+}
 
 _BINARY_EXTS = {
     ".exe", ".dll", ".so", ".png", ".jpg", ".jpeg", ".gif", ".pdf",
@@ -199,27 +214,51 @@ class Spinner:
         self.message = message
         self.running = False
         self.thread = None
+        self._lock = threading.Lock()
 
     def start(self, message=None):
-        if message:
-            self.message = message
-        self.running = True
-        self.thread = threading.Thread(target=self._spin, daemon=True)
-        self.thread.start()
+        with self._lock:
+            if self.running:
+                return
+            if message:
+                self.message = message
+            self.running = True
+            self.thread = threading.Thread(target=self._spin, daemon=True)
+            self.thread.start()
 
     def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(0.3)
-        sys.stdout.write("\r" + " " * 40 + "\r")
-        sys.stdout.flush()
+        with self._lock:
+            if not self.running and self.thread is None:
+                return
+            self.running = False
+            thread = self.thread
+            self.thread = None
+        if thread:
+            thread.join(0.3)
+        try:
+            sys.stdout.write("\r" + " " * 40 + "\r")
+            sys.stdout.flush()
+        except (ValueError, OSError):
+            pass
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
 
     def _spin(self):
         chars = "-/|\\-/|\\"
         i = 0
         while self.running:
-            sys.stdout.write(f"\r{chars[i % len(chars)]} {self.message}")
-            sys.stdout.flush()
+            try:
+                sys.stdout.write(f"\r{chars[i % len(chars)]} {self.message}")
+                sys.stdout.flush()
+            except (ValueError, OSError):
+                # stdout was swapped out or closed (TUI teardown).
+                return
             time.sleep(0.1)
             i += 1
 
@@ -232,22 +271,87 @@ _DONE_PHRASES = re.compile(
     re.IGNORECASE,
 )
 
-_NEGATION = re.compile(r"\b(не|not|н[ие]т|cannot|can't|failed|ошибка|error)\b", re.IGNORECASE)
+# Words that flip the meaning of a completion claim. Applied only to the
+# sentence carrying the claim: scanning a 300-char window meant an unrelated
+# "ошибок нет" elsewhere in the paragraph suppressed a genuine completion,
+# while "не удалось, но всё готово" was accepted because the negation sat
+# outside the window.
+_NEGATION = re.compile(
+    r"(?:^|[\s,(])(?:не|нет|ещё\s+не|пока\s+не|not|no|cannot|can't|couldn't|"
+    r"unable|failed|fails|failing|ошибка|ошибки|ошибок|неудач)\b",
+    re.IGNORECASE,
+)
+
+# A claim followed by more work is not a completion.
+_CONTINUATION = re.compile(
+    r"\b(?:next|then|now\s+i|осталось|далее|теперь|следующ|todo|remaining|"
+    r"still\s+need|нужно\s+ещё)\b",
+    re.IGNORECASE,
+)
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?\n])\s+")
 
 
 def _looks_done(text: str) -> bool:
+    """True when the model states the task is finished, without hedging."""
     if not text:
         return False
     if _DONE_MARKER.search(text):
         return True
-    tail = text[-300:]
-    if _DONE_PHRASES.search(tail) and not _NEGATION.search(tail):
+
+    tail = text[-400:]
+    sentences = _SENTENCE_SPLIT.split(tail)
+    for i, sentence in enumerate(sentences):
+        if not _DONE_PHRASES.search(sentence):
+            continue
+        if _NEGATION.search(sentence):
+            continue
+        # "Готово. Теперь добавлю тесты." is not a completion. The promise of
+        # more work usually lands in the sentence *after* the claim, so the
+        # remainder of the reply has to be checked too.
+        rest = " ".join(sentences[i:])
+        if _CONTINUATION.search(rest):
+            continue
         return True
     return False
 
 
 TOOL_RESULT_CAP = 4000
 KEEP_FULL_TOOL_RESULTS = 5
+
+# Hard ceiling on the combined length of streamed tool arguments. A complete
+# small-model file write is well under this; anything past it is a runaway
+# generation, and letting it finish costs minutes of wall clock for output that
+# is discarded anyway.
+MAX_TOOL_ARG_CHARS = 8000
+
+# The same ceiling for prose. The repetition check alone is not enough: a model
+# can emit thousands of characters of non-repeating text that is still not an
+# answer (one observed round produced 3135 chars over 251s), and `respond` is
+# the only sanctioned way for this agent to talk to the user anyway.
+MAX_CONTENT_CHARS = 4000
+
+# How much streamed argument text to accumulate before looking for repetition.
+_ARG_REPEAT_MIN = 500
+_ARG_REPEAT_WINDOW = 160
+
+
+def _args_repeating(tool_calls: dict) -> bool:
+    """True when a streamed tool argument has started repeating itself.
+
+    Mirrors the check applied to prose. A small model that loses its place
+    inside a long JSON string tends to re-emit the same block over and over,
+    and without this the loop only ends when max_tokens runs out.
+    """
+    for call in tool_calls.values():
+        args = call.get("args") or ""
+        if len(args) < _ARG_REPEAT_MIN:
+            continue
+        tail = args[-_ARG_REPEAT_WINDOW:]
+        prev = args[:-_ARG_REPEAT_WINDOW]
+        if prev.rfind(tail) >= max(0, len(prev) - _ARG_REPEAT_WINDOW * 2):
+            return True
+    return False
 
 # The system prompt asks for one call per step; this caps the damage when the
 # model ignores that and returns a whole batch.
@@ -399,8 +503,20 @@ class SessionManager:
         PLANS_DIR.mkdir(parents=True, exist_ok=True)
 
     def _safe_path(self, name: str) -> Path:
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip()
-        return SESSION_DIR / f"{safe or 'session'}.json"
+        """Map a session name to a file, without letting two names collide.
+
+        Sanitising alone is not injective: "my session" and "my_session" both
+        became "my_session.json", so saving one silently overwrote the other.
+        A short hash of the original name disambiguates them while keeping the
+        readable part in the filename.
+        """
+        import hashlib
+
+        name = (name or "").strip() or "session"
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip("_")
+        safe = safe[:40] or "session"
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        return SESSION_DIR / f"{safe}-{digest}.json"
 
     def save(self, name: str, messages: list, plan_mode: bool, model: str, workspace: str):
         path = self._safe_path(name)
@@ -409,24 +525,46 @@ class SessionManager:
             "model": model,
             "workspace": workspace,
             "plan_mode": plan_mode,
-            "messages": messages,
+            # The token-count cache is an internal tuple; it is not JSON data
+            # and must not be reloaded as if it were part of the conversation.
+            "messages": [
+                {k: v for k, v in m.items() if k != "_tok_cache"} for m in messages
+            ],
             "timestamp": time.time(),
         }
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = path.with_suffix(".json.tmp")
+        # Written via a temp file: a crash midway through a long history used
+        # to leave a truncated JSON file that could never be loaded again.
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
         return path
 
     def load(self, name: str) -> dict | None:
-        path = self._safe_path(name)
-        if not path.exists():
-            alt = SESSION_DIR / f"{name}.json"
-            if not alt.exists():
-                return None
-            path = alt
-        return json.loads(path.read_text(encoding="utf-8"))
+        candidates = [self._safe_path(name), SESSION_DIR / f"{name}.json"]
+        for path in candidates:
+            if path.exists():
+                try:
+                    return json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        # Sessions written before the naming scheme changed do not map back
+        # through _safe_path, so fall back to matching the stored name.
+        for path in SESSION_DIR.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("name") == name:
+                return data
+        return None
 
     def list(self) -> list[dict]:
         results = []
-        for f in sorted(SESSION_DIR.glob("*.json"), key=os.path.getmtime, reverse=True):
+        try:
+            files = sorted(SESSION_DIR.glob("*.json"), key=os.path.getmtime, reverse=True)
+        except OSError:
+            return results
+        for f in files:
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
                 results.append({
@@ -463,6 +601,15 @@ class TinyCodeAgent:
         self.sessions = SessionManager(config.workspace)
         self.aborted = False
         self._current_stream = None
+        # Per-turn record of completed work, surfaced to the model in
+        # _env_state so it stops redoing things it has already finished.
+        self._progress: list[str] = []
+        self._verified_files: set[str] = set()
+        # Files that were written AND then executed successfully. Rewriting one
+        # of these wholesale is refused: it is the observed failure mode where
+        # a model destroys work it had already completed.
+        self._proven_files: set[str] = set()
+        self._rewrite_blocks = 0
 
     def _env_state(self) -> str:
         """Small models do not check state before acting, so state is given to them.
@@ -487,10 +634,44 @@ class TinyCodeAgent:
             listing = ", ".join(entries[:25]) if entries else "(empty)"
             if len(entries) > 25:
                 listing += f", ... (+{len(entries) - 25} more)"
-        except OSError:
+        except (OSError, ValueError):
             listing = "(unreadable)"
         lines.append(f"files here: {listing}")
+
+        # Small models lose track of their own progress once tool results are
+        # compacted out of history, and then redo finished work. An explicit
+        # ledger of what this turn already accomplished is what stops a model
+        # from rewriting a file it has already written and verified.
+        ledger = self._progress_lines()
+        if ledger:
+            lines.append("")
+            lines.append("ALREADY DONE THIS TURN (do not redo any of this):")
+            lines.extend(f"- {entry}" for entry in ledger)
+            if self._proven_files:
+                proven = ", ".join(sorted(self._proven_files))
+                lines.append(
+                    f"{proven} already ran correctly. Rewriting it is REFUSED. "
+                    "The task is finished - call respond now."
+                )
+            elif self._verified_files:
+                lines.append(
+                    "These files are written and syntactically valid. Run them "
+                    "instead of rewriting them."
+                )
         return "ENVIRONMENT STATE\n" + "\n".join(lines)
+
+    def _progress_lines(self) -> list[str]:
+        return list(self._progress)[-8:]
+
+    def _note_progress(self, entry: str) -> None:
+        if entry not in self._progress:
+            self._progress.append(entry)
+
+    def _reset_progress(self) -> None:
+        self._progress = []
+        self._verified_files = set()
+        self._proven_files = set()
+        self._rewrite_blocks = 0
 
     def _add_msg(self, msg):
         self.messages.append(msg)
@@ -500,10 +681,15 @@ class TinyCodeAgent:
         self.messages.clear()
         self.ctx.reset()
 
+    # Fields the agent keeps for its own bookkeeping. None of them are part of
+    # the OpenAI schema, so they must be stripped before a request goes out and
+    # before a session is written to disk.
+    INTERNAL_FIELDS = ("reasoning_content", "cut", "truncated", "_tok_cache")
+
     def _normalize_messages(self, messages: list) -> list:
         # Qwen best practice: history keeps only final output, never thinking.
         messages = [
-            {k: v for k, v in m.items() if k not in ("reasoning_content", "cut")}
+            {k: v for k, v in m.items() if k not in self.INTERNAL_FIELDS}
             for m in messages
         ]
         normalized = []
@@ -538,7 +724,7 @@ class TinyCodeAgent:
             "temperature": self.config.temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "timeout": 90,
+            "timeout": getattr(self.config, "request_timeout", 90),
         }
 
         if no_thinking:
@@ -576,7 +762,6 @@ class TinyCodeAgent:
         try:
             stream = self.client.chat.completions.create(**kwargs)
             self._current_stream = stream
-            spinner.stop()
             if not silent:
                 self._llm_calls += 1
                 sys.stdout.write(f"\r  [#{self._llm_calls} модель думает…]" + " " * 10)
@@ -584,6 +769,9 @@ class TinyCodeAgent:
             try:
                 result = self._process_stream(stream, silent)
             finally:
+                # The spinner must stop even if the stream raises midway,
+                # otherwise its thread keeps overwriting the error message.
+                spinner.stop()
                 try:
                     stream.close()
                 except Exception:
@@ -592,7 +780,8 @@ class TinyCodeAgent:
             return result
         except (openai.APITimeoutError, TimeoutError):
             spinner.stop()
-            print("\n  [Model stalled (90s timeout). Forcing continue.]")
+            timeout = getattr(self.config, "request_timeout", 90)
+            print(f"\n  [Model stalled ({timeout}s timeout). Forcing continue.]")
             return None
         except openai.APIConnectionError:
             spinner.stop()
@@ -625,6 +814,7 @@ class TinyCodeAgent:
         tool_calls = collections.defaultdict(lambda: {"name": "", "args": "", "id": ""})
         finish_reason = None
         repeated = False
+        overlong = False
 
         def _status(label, n):
             sys.stdout.write(f"\r  [#{self._llm_calls} {label}: {n} ток • {time.time() - start:.0f}с]" + " " * 10)
@@ -657,6 +847,9 @@ class TinyCodeAgent:
                 content += delta.content
                 if not silent:
                     _status("модель отвечает", len(content))
+                if len(content) > MAX_CONTENT_CHARS:
+                    overlong = True
+                    break
                 if len(content) > 600:
                     # Both sides must be lowered; comparing a lowered tail
                     # against the raw text missed every repetition that
@@ -669,9 +862,6 @@ class TinyCodeAgent:
                         break
 
             if delta.tool_calls:
-                if not silent:
-                    sys.stdout.write(f"\r  [#{self._llm_calls} модель готовит вызов инструмента…]" + " " * 10)
-                    sys.stdout.flush()
                 for tc in delta.tool_calls:
                     idx = tc.index if tc.index is not None else len(tool_calls)
                     if tc.id:
@@ -681,6 +871,21 @@ class TinyCodeAgent:
                             tool_calls[idx]["name"] += tc.function.name
                         if tc.function.arguments:
                             tool_calls[idx]["args"] += tc.function.arguments
+                # Tool arguments were streamed with no guard at all: the
+                # repetition and length checks above only ran on `content`,
+                # which `tool_choice="required"` makes the model skip. A 2B
+                # model looping inside a write_file argument could therefore
+                # burn the entire max_tokens budget - one observed run spent
+                # 629s emitting 1197 tokens of malformed code.
+                args_len = sum(len(t["args"]) for t in tool_calls.values())
+                if not silent:
+                    _status("модель готовит вызов", args_len)
+                if args_len > MAX_TOOL_ARG_CHARS:
+                    overlong = True
+                    break
+                if _args_repeating(tool_calls):
+                    repeated = True
+                    break
 
         if self.aborted:
             return None
@@ -702,10 +907,23 @@ class TinyCodeAgent:
             sys.stdout.write(summary + "\n")
             sys.stdout.flush()
 
-        if repeated and not tool_calls:
+        if (repeated or overlong) and not tool_calls:
             if not silent:
-                print("\n  [repetition detected, response cut]")
+                reason = "too long" if overlong else "repetition"
+                print(f"\n  [{reason}, response cut]")
             return {"role": "assistant", "content": content, "cut": "repetition"}
+
+        if tool_calls and (overlong or repeated):
+            # The call was cut mid-stream, so its arguments are incomplete by
+            # construction. Marking it runaway makes the loop feed back a
+            # corrective message instead of trying to execute a partial call.
+            if not silent:
+                reason = "too long" if overlong else "repeating"
+                print(f"\n  [tool arguments {reason}, generation cut]")
+            result = self._build_from_stream(content, tool_calls, finish_reason)
+            if result:
+                result["runaway"] = "overlong" if overlong else "repetition"
+                return result
 
         if tool_calls:
             result = self._build_from_stream(content, tool_calls, finish_reason)
@@ -762,27 +980,52 @@ class TinyCodeAgent:
 
     WRITE_TOOLS = {"write_file", "edit_file", "run_bash"}
 
+    # Every tool argument that names a filesystem location. `path` alone was
+    # checked before, so `run_bash` (which has no `path`) skipped the sandbox
+    # completely and could write anywhere on the machine.
+    PATH_ARGS = ("path", "cwd", "file", "filepath", "directory", "dir")
+
     def _enforce_workspace(self, name: str, args: dict) -> str | None:
         ws = self.config.workspace
         if not ws:
             return None
         ws = Path(ws).resolve()
 
-        raw = args.get("path")
-        if raw is None:
-            return None
+        if name == "run_bash":
+            return self._enforce_bash_workspace(args, ws)
 
-        raw = str(raw)
+        for key in self.PATH_ARGS:
+            if key not in args or args[key] is None:
+                continue
+            err = self._enforce_path_arg(args, key, ws)
+            if err:
+                return err
+        return None
+
+    def _enforce_bash_workspace(self, args: dict, ws: Path) -> str | None:
+        """Contain a shell command: it runs in the workspace and stays there."""
+        command = str(args.get("command", ""))
+        problem = check_command(command, ws)
+        if problem:
+            return f"Error: {problem}"
+        # The tool no longer relies on the process working directory, which is
+        # global state shared with the TUI thread.
+        args["cwd"] = str(ws)
+        return None
+
+    def _enforce_path_arg(self, args: dict, key: str, ws: Path) -> str | None:
+        raw = str(args[key])
         try:
-            candidate = Path(raw)
-            resolved = candidate.resolve() if candidate.is_absolute() else (ws / candidate).resolve()
-            resolved.relative_to(ws)
+            resolve_in_workspace(raw, ws)
             return None
-        except ValueError:
+        except SandboxError:
             # Genuinely outside the workspace - fall through to repair/refuse.
             pass
         except OSError:
             return f"Error: '{raw}' is not a usable path."
+        return self._repair_path(args, key, raw, ws)
+
+    def _repair_path(self, args: dict, key: str, raw: str, ws: Path) -> str | None:
 
         # Small models mangle long absolute paths ("ai_sa sandbox\calc.py").
         # If the file name alone is unambiguous and exists in the workspace,
@@ -790,12 +1033,8 @@ class TinyCodeAgent:
         basename = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
         if basename and basename not in (".", ".."):
             repaired = (ws / basename).resolve()
-            try:
-                repaired.relative_to(ws)
-            except ValueError:
-                repaired = None
-            if repaired is not None and repaired.exists():
-                args["path"] = basename
+            if is_within(repaired, ws) and repaired.exists():
+                args[key] = basename
                 print(f"  [path corrected: {raw!r} -> {basename!r}]")
                 return None
 
@@ -808,7 +1047,7 @@ class TinyCodeAgent:
             if basename and basename not in (".", ".."):
                 exact = [c for c in candidates if Path(c).name.lower() == basename.lower()]
                 if len(exact) == 1:
-                    args["path"] = exact[0]
+                    args[key] = exact[0]
                     print(f"  [path corrected: {raw!r} -> {exact[0]!r}]")
                     return None
             return (
@@ -831,14 +1070,9 @@ class TinyCodeAgent:
         cheaper than discovering a corrupted workspace afterward.
         """
         if name == "run_bash":
-            cmd = str(args.get("command", "")).lower()
-            for pat in _CRITIC_BASH_DANGEROUS:
-                if re.search(pat, cmd):
-                    return (
-                        f"Error: command rejected by critic pass — matches a "
-                        f"destructive pattern ({pat!r}). Rewrite it to be safe "
-                        "or use a narrower, non-destructive command."
-                    )
+            problem = check_command(str(args.get("command", "")), self.config.workspace)
+            if problem:
+                return f"Error: {problem}"
             return None
         if name in ("write_file", "edit_file"):
             path = str(args.get("path", ""))
@@ -847,6 +1081,29 @@ class TinyCodeAgent:
                     f"Error: '{path}' looks like a binary file. Writing text to "
                     "it will corrupt the file. Use a text-based format or a "
                     "binary-safe tool."
+                )
+        if name == "write_file":
+            shown = self._relative_path(args.get("path", ""))
+            # Rule 9 of the system prompt ("do not rewrite a file you just
+            # created") is advice a 2B model ignores. Enforcing it mechanically
+            # is what actually stops the observed failure: the model wrote a
+            # correct file, ran it successfully, then rewrote it into garbage
+            # three times over. A whole-file overwrite is refused; edit_file
+            # (a targeted change) stays available for genuine fixes.
+            if shown in self._proven_files:
+                self._rewrite_blocks += 1
+                if self._rewrite_blocks >= 3:
+                    return (
+                        f"Error: '{shown}' already works and you keep trying to "
+                        "replace it. Stop. Call respond with a one-sentence "
+                        "summary now."
+                    )
+                return (
+                    f"Error: '{shown}' was already written AND ran correctly this "
+                    "turn, so rewriting the whole file is refused. If the task is "
+                    "done, call respond now. If one specific line is genuinely "
+                    "wrong, change just that line with edit_file(start_line=..., "
+                    "end_line=..., new_string=...)."
                 )
         return None
 
@@ -860,12 +1117,10 @@ class TinyCodeAgent:
         guarded runtime pass so import/runtime errors surface too.
         """
         try:
-            p = Path(path_str)
-            if not p.is_absolute():
-                p = (Path(self.config.workspace) / p).resolve()
+            p = resolve_in_workspace(str(path_str), self.config.workspace)
             if not p.exists() or p.suffix != ".py":
                 return None
-        except (OSError, ValueError):
+        except (SandboxError, OSError, ValueError):
             return None
 
         # 1) Syntax check — always safe, catches most 2B failures.
@@ -873,7 +1128,9 @@ class TinyCodeAgent:
             proc = subprocess.run(
                 [sys.executable, "-m", "py_compile", str(p)],
                 capture_output=True, text=True, timeout=25,
+                encoding="utf-8", errors="replace",
                 cwd=str(self.config.workspace),
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             return None
@@ -885,13 +1142,24 @@ class TinyCodeAgent:
             )
 
         # 2) Guarded runtime check for runnable scripts only.
+        #
+        # Executing freshly generated code is a real risk, so it is opt-in.
+        # The syntax pass above is always on and catches the bulk of 2B
+        # failures without running anything.
+        if not getattr(self.config, "verify_run", False):
+            return None
+        if self.config.permission_mode == "deny":
+            return None
+
         try:
             src = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
         if "__main__" not in src:
             return None
-        if any(tok in src for tok in _VERIFY_UNSAFE):
+        unsafe = _unsafe_to_run(src)
+        if unsafe:
+            print(f"  [auto-verify: not running {p.name} — it {unsafe}]")
             return None
         # An interactive program cannot be run headless: with no stdin the very
         # first input() raises EOFError, which looks exactly like a crash. The
@@ -901,8 +1169,11 @@ class TinyCodeAgent:
 
         try:
             proc = subprocess.run(
-                [sys.executable, str(p)],
+                # -I isolates the run: no user site-packages, no PYTHON* env
+                # vars, no cwd on sys.path beyond the script's own directory.
+                [sys.executable, "-I", str(p)],
                 capture_output=True, text=True, timeout=15,
+                encoding="utf-8", errors="replace",
                 cwd=str(self.config.workspace),
                 stdin=subprocess.DEVNULL,
             )
@@ -941,9 +1212,13 @@ class TinyCodeAgent:
         """
         ws = Path(self.config.workspace).resolve()
         tokens = _tokenize_cmd(command)
+        n = len(tokens)
+        # Only a spaced path is worth probing, and a real one is short. The
+        # unbounded window made this O(n^2) in filesystem stats: a 20-token
+        # command issued 200 of them before running anything.
+        max_window = 6
         out = []
         i = 0
-        n = len(tokens)
         while i < n:
             raw, was_quoted = tokens[i]
             if was_quoted:
@@ -951,16 +1226,24 @@ class TinyCodeAgent:
                 i += 1
                 continue
             best = None
-            for j in range(i + 1, n + 1):
+            limit = min(n, i + max_window)
+            for j in range(i + 1, limit + 1):
                 window = tokens[i:j]
                 if any(q for _, q in window):
                     break
                 joined = " ".join(t for t, _ in window)
+                # A single token that already resolves needs no quoting; only
+                # a multi-token run can be split by the shell.
+                if j - i == 1:
+                    continue
                 cand = Path(joined)
                 if not cand.is_absolute():
                     cand = ws / joined
-                if cand.exists():
-                    best = j
+                try:
+                    if cand.exists():
+                        best = j
+                except OSError:
+                    break
             if best is not None:
                 joined = " ".join(t for t, _ in tokens[i:best])
                 out.append('"' + joined + '"')
@@ -969,6 +1252,46 @@ class TinyCodeAgent:
                 out.append(raw)
                 i += 1
         return " ".join(out)
+
+    def _absolutize_paths(self, name: str, args: dict) -> None:
+        """Rewrite relative path arguments against the workspace.
+
+        The tools used to rely on the process working directory being chdir-ed
+        into the workspace for the duration of the call. Resolving here instead
+        removes that global mutation while keeping bare relative names (which
+        is all a small model reliably produces) working.
+        """
+        ws = Path(self.config.workspace).resolve()
+        if name == "run_bash":
+            args.setdefault("cwd", str(ws))
+            return
+
+        # A tool whose `path` defaults to "." used to mean "the workspace"
+        # only because the process had been chdir-ed into it. Without that,
+        # an omitted argument silently searched the directory the agent was
+        # launched from, leaking files from outside the project.
+        fn = self.tool_map.get(name)
+        if fn is not None:
+            params = inspect.signature(fn).parameters
+            for key in ("path", "directory", "dir"):
+                param = params.get(key)
+                if param is None:
+                    continue
+                if args.get(key) in (None, "", "."):
+                    args[key] = str(ws)
+
+        for key in self.PATH_ARGS:
+            if key not in args or args[key] is None:
+                continue
+            raw = str(args[key])
+            if not raw:
+                continue
+            try:
+                args[key] = str(resolve_in_workspace(raw, ws))
+            except (SandboxError, OSError, ValueError):
+                # _enforce_workspace already refused anything unsafe; leaving
+                # the value untouched keeps the tool's own error message.
+                pass
 
     def _execute_tool(self, name: str, args: dict) -> str:
         if name not in self.tool_map:
@@ -1018,10 +1341,12 @@ class TinyCodeAgent:
         if name == "run_bash":
             print("  [команда выполняется…]", flush=True)
 
-        orig_cwd = os.getcwd()
+        # Paths are made absolute against the workspace instead of chdir-ing
+        # the process. os.chdir mutates state shared by every thread, and in
+        # the TUI the agent runs in a worker while Textual renders in another.
+        self._absolutize_paths(name, args)
+
         try:
-            if self.config.workspace:
-                os.chdir(self.config.workspace)
             result = str(fn(**args))
         except TypeError as e:
             # Almost always the model inventing or omitting a parameter. Say so
@@ -1036,18 +1361,43 @@ class TinyCodeAgent:
             )
         except Exception as e:
             return f"Error executing {name}: {e}"
-        finally:
-            try:
-                os.chdir(orig_cwd)
-            except OSError:
-                pass
 
         if name in ("write_file", "edit_file") and not result.startswith("Error:"):
             verify = self._verify_file(args.get("path", ""))
+            shown = self._relative_path(args.get("path", ""))
             if verify:
                 print("  [auto-verify: ошибки в файле, возвращаю модели для фикса]")
                 result = f"{result}\n\n{verify}"
+                self._verified_files.discard(shown)
+                self._note_progress(f"wrote {shown} - but it has errors, fix it")
+            else:
+                self._verified_files.add(shown)
+                self._note_progress(f"wrote {shown} (syntax OK)")
+
+        if name == "run_bash" and not result.startswith("Error:"):
+            cmd = str(args.get("command", ""))
+            failed = result.startswith("Exit code:")
+            outcome = "FAILED" if failed else "ran fine"
+            first = next(
+                (l for l in result.splitlines() if l.strip() and not l.startswith("Exit code:")),
+                "",
+            )
+            self._note_progress(f"ran `{cmd[:60]}` - {outcome}: {first[:70]}")
+            # A script that a command just executed cleanly is proven to work;
+            # from here on, replacing it wholesale is treated as a regression
+            # rather than progress.
+            if not failed:
+                for token in re.findall(r"[\w./\\-]+\.py", cmd):
+                    self._proven_files.add(self._relative_path(token))
+
         return result
+
+    def _relative_path(self, path_str: str) -> str:
+        """Workspace-relative name for display, falling back to the basename."""
+        try:
+            return str(Path(path_str).resolve().relative_to(Path(self.config.workspace).resolve()))
+        except (ValueError, OSError):
+            return Path(str(path_str)).name or str(path_str)
 
     def _process_turn(self, max_rounds: int = None, silent=False):
         if max_rounds is None:
@@ -1060,7 +1410,19 @@ class TinyCodeAgent:
         did_work = False
         text_only_rounds = 0
         self.aborted = False
+        self._reset_progress()
+        budget = self.config.turn_budget_seconds
+        started = time.time()
         for rnd in range(max_rounds):
+            # A wall-clock budget bounds what an iteration cap cannot: a small
+            # model can spend minutes inside a single round, so 8 rounds is not
+            # the same as a bounded amount of time. Elapsed time is measured
+            # against the turn's start, so the check is meaningful on the very
+            # first round too.
+            if budget and time.time() - started >= budget:
+                print(f"\n  [time budget ({budget}s) reached, stopping]\n")
+                self._summarize_progress()
+                return
             if self.aborted:
                 print("\n  [прервано пользователем]\n")
                 return
@@ -1123,7 +1485,18 @@ class TinyCodeAgent:
                                 print()
                             return
                         print(f"  [{rnd+1}/{max_rounds} tool: {name}({_short_args(args)})]", flush=True)
-                        if msg.get("truncated") and name in ("write_file", "edit_file"):
+                        if msg.get("runaway"):
+                            # Nothing was executed: the arguments were cut off
+                            # mid-generation. Say so plainly and point at the
+                            # smaller operation, or at finishing the turn.
+                            result = (
+                                "Error: your tool call ran away (the arguments kept "
+                                "growing or repeating) and was stopped, so NOTHING was "
+                                "written or run. Do not resend it. If the work is "
+                                "already done, call respond now. If not, make ONE small "
+                                "change with edit_file(start_line=..., end_line=...)."
+                            )
+                        elif msg.get("truncated") and name in ("write_file", "edit_file"):
                             target = str(args.get("path", "the file"))
                             exists = False
                             try:
@@ -1265,6 +1638,16 @@ class TinyCodeAgent:
             print(msg["content"].strip())
         print()
 
+    def _summarize_progress(self) -> None:
+        """Print what was accomplished when a turn ends without a `respond`."""
+        entries = self._progress_lines()
+        if not entries:
+            return
+        print("  Работа, которая была выполнена:")
+        for entry in entries:
+            print(f"    - {entry}")
+        print()
+
     def _show_plan(self, plan: str):
         """Store, print and persist a finished plan."""
         self._last_plan = plan
@@ -1278,8 +1661,27 @@ class TinyCodeAgent:
             print(f"  {line}")
         print("=" * 50)
 
-        plan_path = PLANS_DIR / f"plan_{int(time.time())}.md"
-        plan_path.write_text(plan, encoding="utf-8")
+        try:
+            plan_path = PLANS_DIR / f"plan_{int(time.time())}.md"
+            plan_path.write_text(plan, encoding="utf-8")
+            self._prune_plans()
+        except OSError as e:
+            print(f"  [could not save plan: {e}]")
+
+    def _prune_plans(self) -> None:
+        """Keep the plans directory bounded - one file was written per run."""
+        keep = getattr(self.config, "max_saved_plans", 50)
+        if keep <= 0:
+            return
+        try:
+            plans = sorted(PLANS_DIR.glob("plan_*.md"), key=os.path.getmtime, reverse=True)
+        except OSError:
+            return
+        for stale in plans[keep:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     def _process_plan_turn(self):
         print("  [analyzing and creating plan...]")
@@ -1529,7 +1931,15 @@ class TinyCodeAgent:
 
         elif c.startswith("!"):
             cmd_text = c[1:].strip()
-            result = self.tool_map["run_bash"](command=cmd_text)
+            if not cmd_text:
+                print("  [usage: ! <command>]\n")
+                return True
+            # An explicit cwd is required: this path never went through
+            # _execute_tool, so the command used to run in whatever directory
+            # the process happened to be in.
+            result = self.tool_map["run_bash"](
+                command=cmd_text, cwd=str(Path(self.config.workspace).resolve())
+            )
             print(result)
             return True
 
@@ -1658,6 +2068,44 @@ def _is_interactive(src: str) -> bool:
     pass has to be skipped rather than reported as a crash.
     """
     return any(tok in src for tok in _INTERACTIVE_TOKENS)
+
+
+def _unsafe_to_run(src: str) -> str | None:
+    """Decide whether generated code is safe to execute for verification.
+
+    Returns a reason string when it is not. Anything that cannot be parsed or
+    understood is treated as unsafe: this gate exists to prevent execution, so
+    the default answer has to be "no".
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return "file does not parse"
+    except (ValueError, RecursionError):
+        return "file cannot be analysed"
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _VERIFY_UNSAFE_MODULES:
+                    return f"imports {root}"
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in _VERIFY_UNSAFE_MODULES:
+                return f"imports from {root}"
+            if node.level and node.level > 0:
+                return "uses a relative import"
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _VERIFY_UNSAFE_ATTRS:
+                return f"calls .{node.attr}()"
+            # Dunder access is the standard sandbox-escape primitive.
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return f"touches {node.attr}"
+        elif isinstance(node, ast.Name):
+            if node.id in _VERIFY_UNSAFE_NAMES:
+                return f"uses {node.id}()"
+    return None
 
 
 def _summarize_traceback(text: str, keep: int = 8) -> list[str]:
