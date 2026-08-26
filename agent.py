@@ -20,6 +20,37 @@ from context import count_message_tokens
 from tools.glob import suggest_files
 
 
+def _tokenize_cmd(cmd: str):
+    """Split a command into tokens, keeping quoted spans (single or double)
+    as one token. Returns a list of (raw_text, was_quoted) tuples."""
+    tokens = []
+    cur = ""
+    cur_quoted = False
+    in_q = None
+    for ch in cmd:
+        if in_q:
+            cur += ch
+            if ch == in_q:
+                in_q = None
+            continue
+        if ch in "\"'":
+            if cur == "":
+                cur_quoted = True
+            in_q = ch
+            cur += ch
+            continue
+        if ch in " \t":
+            if cur != "":
+                tokens.append((cur, cur_quoted))
+                cur = ""
+                cur_quoted = False
+            continue
+        cur += ch
+    if cur != "":
+        tokens.append((cur, cur_quoted))
+    return tokens
+
+
 def _safe_json_loads(text: str):
     if not text or not text.strip():
         return None
@@ -899,6 +930,46 @@ class TinyCodeAgent:
             )
         return None
 
+    def _quote_existing_paths(self, command: str) -> str:
+        """On Windows, a small model often writes `python src/Cookie Clicker.py`
+        without quoting the path. PowerShell then splits on the space and Python
+        tries to open `src\\Cookie`, which (resolved against the workspace) does
+        not exist. If a run of unquoted tokens, joined by spaces, names a file
+        that actually exists in the workspace, wrap just that run in double quotes.
+        Ordinary spaced arguments (whose joined form is not a real file) are left
+        untouched, so this never mangles legitimate commands.
+        """
+        ws = Path(self.config.workspace).resolve()
+        tokens = _tokenize_cmd(command)
+        out = []
+        i = 0
+        n = len(tokens)
+        while i < n:
+            raw, was_quoted = tokens[i]
+            if was_quoted:
+                out.append(raw)
+                i += 1
+                continue
+            best = None
+            for j in range(i + 1, n + 1):
+                window = tokens[i:j]
+                if any(q for _, q in window):
+                    break
+                joined = " ".join(t for t, _ in window)
+                cand = Path(joined)
+                if not cand.is_absolute():
+                    cand = ws / joined
+                if cand.exists():
+                    best = j
+            if best is not None:
+                joined = " ".join(t for t, _ in tokens[i:best])
+                out.append('"' + joined + '"')
+                i = best
+            else:
+                out.append(raw)
+                i += 1
+        return " ".join(out)
+
     def _execute_tool(self, name: str, args: dict) -> str:
         if name not in self.tool_map:
             return f"Error: Unknown tool '{name}'"
@@ -925,6 +996,10 @@ class TinyCodeAgent:
             if cleaned != original:
                 print(f"  [command normalized: {cleaned}]")
                 args["command"] = cleaned
+            quoted = self._quote_existing_paths(args.get("command", ""))
+            if quoted != args.get("command", ""):
+                print(f"  [path quoted: {quoted}]")
+                args["command"] = quoted
 
         # The critic runs before any prompt: asking the user to approve a
         # command that is going to be rejected anyway is pure noise.

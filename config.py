@@ -5,18 +5,18 @@ from pathlib import Path
 @dataclass
 class Config:
     lmstudio_host: str = "127.0.0.1"
-    lmstudio_port: int = 8080
+    lmstudio_port: int = 8081
     # llama.cpp ignores this field (the model is chosen when the server starts),
     # so a plain label works. Override with TINY_CODE_MODEL when the backend
     # does care, e.g. LM Studio or any multi-model gateway.
-    model_name: str = "qwen3.5-2b"
+    model_name: str = "gemma-4-E2B-it-Q4_K_M.gguf"
 
-    # The server runs with -c 32768. The prompt must leave room for the reply
+    # The server runs with -c 16384. The prompt must leave room for the reply
     # (max_tokens) plus chat-template overhead, otherwise llama.cpp rejects the
     # request with HTTP 400 "exceeds the available context size".
     max_tokens: int = 4096
-    server_context: int = 32768
-    context_limit: int = 26000
+    server_context: int = 16384
+    context_limit: int = 12000
     max_tool_rounds: int = 50
     # Plans and summaries share this budget with the model's reasoning, so 512
     # leaves too little for the text itself and the plan gets cut mid-sentence.
