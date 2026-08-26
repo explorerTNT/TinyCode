@@ -18,6 +18,7 @@ NOISE_EXTS = {
 }
 MAX_FILES = 20000
 SCAN_TIMEOUT = 10
+SUGGEST_TIMEOUT = 3
 
 
 def list_files(pattern: str = "*", path: str = ".") -> str:
@@ -34,7 +35,7 @@ def list_files(pattern: str = "*", path: str = ".") -> str:
         if not search_path.is_dir():
             return f"Error: Not a directory: {path}"
 
-        return _fallback_glob(pattern, search_path)
+        return _fallback_glob(pattern or "*", search_path)
     except Exception as e:
         return f"Error listing files: {e}"
 
@@ -62,10 +63,13 @@ def _fallback_glob(pattern: str, search_path: Path) -> str:
             scanned += 1
             if scanned > MAX_FILES:
                 return f"Error: Too many files ({MAX_FILES}+). Narrow your search."
+            full = Path(root) / name
+            try:
+                rel = full.relative_to(search_path)
+            except ValueError:
+                continue
             if path_scoped:
-                rel_posix = (
-                    (Path(root) / name).relative_to(search_path).as_posix()
-                )
+                rel_posix = rel.as_posix()
                 matched = fnmatch.fnmatch(rel_posix, norm_pattern)
                 # "src/*.py" should also reach nested files, matching how the
                 # model expects a directory-scoped glob to behave.
@@ -79,12 +83,10 @@ def _fallback_glob(pattern: str, search_path: Path) -> str:
                 if not explicit and Path(name).suffix.lower() in NOISE_EXTS:
                     hidden += 1
                     continue
-                full = Path(root) / name
                 try:
                     stat = full.stat()
                 except OSError:
                     continue
-                rel = full.relative_to(search_path)
                 results.append((rel, stat.st_size, stat.st_mtime))
 
     results.sort(key=lambda x: -x[2])
@@ -95,7 +97,10 @@ def _fallback_glob(pattern: str, search_path: Path) -> str:
     limit = 200 if "*" in pattern or "?" in pattern else 1000
     lines = [f"--- {len(results)} files matching '{pattern}' (newest first) ---"]
     for rel, size, mtime in results[:limit]:
-        lines.append(f"{rel} ({_fmt_size(size)}, {time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))})")
+        lines.append(
+            f"{rel} ({_fmt_size(size)}, "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))})"
+        )
     if len(results) > limit:
         lines.append(f"... and {len(results) - limit} more files")
     if hidden:
@@ -109,24 +114,35 @@ def suggest_files(basename: str, search_path: Path, max_results: int = 5) -> lis
     Matches on exact name, then on 'contains'. Ignores build/binary dirs.
     Returns relative paths, best matches first.
     """
-    target = basename.lower().replace("/", "\\").split("\\")[-1]
-    if not target:
+    target = (basename or "").lower().replace("\\", "/").rstrip("/").split("/")[-1]
+    if not target or target in (".", ".."):
         return []
+    try:
+        root_path = Path(search_path).resolve()
+    except OSError:
+        return []
+    if not root_path.is_dir():
+        return []
+
     exact = []
     contains = []
-    deadline = time.time() + SCAN_TIMEOUT
+    # A shorter budget than the full scan: this runs on an error path, where a
+    # ten-second stall reads like the agent has hung.
+    deadline = time.time() + SUGGEST_TIMEOUT
     try:
-        for root, dirs, files in os.walk(str(search_path)):
-            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        for root, dirs, files in os.walk(str(root_path)):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and not d.startswith(".")]
             if time.time() > deadline:
                 break
             for name in files:
                 low = name.lower()
                 if low == target:
-                    exact.append(str((Path(root) / name).relative_to(search_path)))
+                    exact.append(str((Path(root) / name).relative_to(root_path)))
                 elif target in low and Path(name).suffix.lower() not in NOISE_EXTS:
-                    contains.append(str((Path(root) / name).relative_to(search_path)))
-    except OSError:
+                    contains.append(str((Path(root) / name).relative_to(root_path)))
+            if len(exact) >= max_results:
+                break
+    except (OSError, ValueError):
         return []
     exact.sort()
     contains.sort()
@@ -134,6 +150,8 @@ def suggest_files(basename: str, search_path: Path, max_results: int = 5) -> lis
 
 
 def _fmt_size(size: int) -> str:
-    if size < 1024: return f"{size}B"
-    elif size < 1024 * 1024: return f"{size / 1024:.1f}KB"
-    else: return f"{size / 1024 / 1024:.1f}MB"
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size / 1024 / 1024:.1f}MB"

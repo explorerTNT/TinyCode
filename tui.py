@@ -39,7 +39,14 @@ SYNTAX_THEME = "ansi_dark" if DARK else "ansi_light"
 _QUIT = object()
 
 # Upper bound on log widgets kept alive; older lines are discarded.
-MAX_LOG_LINES = 2000
+# Every mounted Static participates in each relayout, so this is a performance
+# ceiling rather than a memory one - Textual slows noticeably well before the
+# old limit of 2000 was ever reached.
+MAX_LOG_LINES = 500
+
+# Plain text lines are coalesced into a single widget while they arrive faster
+# than this, which is what keeps a chatty tool from mounting hundreds of them.
+LOG_FLUSH_INTERVAL = 0.05
 
 
 class TUIWriter(io.TextIOBase):
@@ -99,10 +106,12 @@ class TUIWriter(io.TextIOBase):
     def flush(self) -> None:
         with self._lock:
             if not self._buf:
+                self.app._flush_pending()
                 return
             renderable = self._render(self._buf)
             self._buf = ""
         self.app.append_line(renderable)
+        self.app._flush_pending()
 
     def _render(self, line: str):
         stripped = line.strip()
@@ -152,6 +161,9 @@ class TinyCodeTUI(App):
         self._last_ctrl_c = 0.0
         self._awaiting_input = False
         self._ui_thread_id = threading.get_ident()
+        self._pending_text: list[Text] = []
+        self._pending_lock = threading.Lock()
+        self._flush_scheduled = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -227,10 +239,15 @@ class TinyCodeTUI(App):
             self.append_line(Text("[Ctrl+C] ещё раз для выхода (или выделите текст мышью, чтобы скопировать)."))
 
     def _restore(self) -> None:
+        # Idempotent: called from both the worker's finally block and
+        # on_unmount, and the second call must not undo an unrelated later
+        # redirection.
         if self._orig_stdout is not None:
             sys.stdout = self._orig_stdout
+            self._orig_stdout = None
         if self._orig_input is not None:
             builtins.input = self._orig_input
+            self._orig_input = None
 
     # ---- redirected stdout -> widgets (must run on the main thread) ----
     def _on_ui_thread(self) -> bool:
@@ -256,7 +273,39 @@ class TinyCodeTUI(App):
     def append_line(self, renderable) -> None:
         if renderable is None:
             return
+        # Consecutive plain-text lines are merged into one widget. Mounting a
+        # Static per line meant a single verbose tool result could add hundreds
+        # of widgets, and Textual's relayout cost scales with that count.
+        if isinstance(renderable, Text):
+            with self._pending_lock:
+                self._pending_text.append(renderable)
+                should_schedule = not self._flush_scheduled
+                self._flush_scheduled = True
+            if should_schedule:
+                self._dispatch(self._schedule_flush)
+            return
+        self._flush_pending()
         self._dispatch(self._write_log, renderable)
+
+    def _schedule_flush(self) -> None:
+        try:
+            self.set_timer(LOG_FLUSH_INTERVAL, self._flush_pending)
+        except Exception:
+            self._flush_pending()
+
+    def _flush_pending(self) -> None:
+        with self._pending_lock:
+            pending = self._pending_text
+            self._pending_text = []
+            self._flush_scheduled = False
+        if not pending:
+            return
+        merged = Text()
+        for i, chunk in enumerate(pending):
+            if i:
+                merged.append("\n")
+            merged.append_text(chunk)
+        self._dispatch(self._write_log, merged)
 
     def _write_log(self, renderable) -> None:
         try:
@@ -264,17 +313,18 @@ class TinyCodeTUI(App):
         except Exception:
             return
         try:
-            line = Static(renderable)
-            log.mount(line)
+            # Follow the tail only when the user has not scrolled up to read
+            # something; checked before mounting, since mounting changes
+            # max_scroll_y and would make the test always pass.
+            at_bottom = log.scroll_offset.y >= log.max_scroll_y - 2
+            log.mount(Static(renderable))
             # Keep the widget count bounded: an unbounded log makes every
             # relayout slower until the UI crawls.
             children = log.children
             if len(children) > MAX_LOG_LINES:
                 for stale in children[: len(children) - MAX_LOG_LINES]:
                     stale.remove()
-            # Only follow the tail when the user has not scrolled up to read
-            # something, otherwise the view jumps away mid-selection.
-            if log.scroll_offset.y >= log.max_scroll_y - 2:
+            if at_bottom:
                 log.scroll_end(animate=False)
         except Exception:
             pass
@@ -322,6 +372,9 @@ class TinyCodeTUI(App):
 
     # ---- redirected input ----
     def _tui_input(self, prompt: str = "") -> str:
+        # Anything buffered must reach the screen before the user is asked to
+        # respond to it, otherwise the question appears above its own context.
+        self._flush_pending()
         self._dispatch(self._enable_input, prompt)
         value = self._input_q.get()
         if value is _QUIT:

@@ -98,7 +98,7 @@ def print_summary(results: list, total_elapsed: float):
 
     if ok:
         avg_time = sum(r["elapsed_s"] for r in ok) / len(ok)
-        avg_rate = sum(r["token_rate"] for r in ok) / len(ok)
+        avg_rate = sum(r.get("token_rate", 0) for r in ok) / len(ok)
         print(f"Avg task time: {avg_time:.2f}s")
         print(f"Avg token rate: {avg_rate:.2f} tok/s")
 
@@ -142,9 +142,14 @@ def main():
 
     print_summary(results, total_elapsed)
 
-    result_file = Path.cwd() / "benchmark_result.json"
+    # Written into the benchmark workspace, not the repository root: the old
+    # path dropped an untracked artefact next to the source on every run.
+    result_file = ws / "benchmark_result.json"
     with open(result_file, "w", encoding="utf-8") as f:
-        json.dump({"model": config.model_name, "results": results, "total_elapsed": total_elapsed}, f, indent=2, ensure_ascii=False)
+        json.dump(
+            {"model": config.model_name, "results": results, "total_elapsed": total_elapsed},
+            f, indent=2, ensure_ascii=False,
+        )
     print(f"\nResults saved to {result_file}")
 
 
