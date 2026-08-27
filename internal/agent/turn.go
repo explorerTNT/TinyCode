@@ -188,7 +188,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 
 				argKey, err := json.Marshal(args)
 				if err != nil {
-					argKey = []byte(fmt.Sprint(args))
+					argKey = fmt.Append(argKey, args)
 				}
 				recentTools = append(recentTools, recentTool{name, string(argKey)})
 				if len(recentTools) > 8 {

@@ -63,6 +63,9 @@ func grepSingleFile(pattern string, filepathAbs string) string {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Sprintf("Error scaning buffer: %v", err)
+	}
 	if len(results) == 0 {
 		return fmt.Sprintf("No matches for '%s' in %s", pattern, filepath.Base(filepathAbs))
 	}
@@ -156,6 +159,9 @@ func fallbackGrep(pattern, searchPath, include string) string {
 					return nil
 				}
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil
 		}
 		return nil
 	})

@@ -487,7 +487,7 @@ func (m *model) treePanelGeometry() (topY, innerHeight int, ok bool) {
 	if treeH < 2 {
 		return 0, 0, false
 	}
-	topY = 1 + (statusH - 2) + 2 // header + status box + tree top border + title
+	topY = 1 + statusH + 2 // header + status box + tree top border + title
 	innerHeight = treeH - 3
 	if innerHeight < 1 {
 		innerHeight = 1

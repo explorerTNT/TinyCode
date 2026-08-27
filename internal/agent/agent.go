@@ -248,7 +248,7 @@ func maybeGitHint(userInput string) string {
 
 // ---- workspace enforcement ----
 
-func (a *Agent) enforceWorkspace(name string, args map[string]any) string {
+func (a *Agent) enforceWorkspace(args map[string]any) string {
 	if a.workspace == "" {
 		return ""
 	}
@@ -354,7 +354,7 @@ func (a *Agent) executeTool(name string, args map[string]any) string {
 		return fmt.Sprintf("Error: `%s` is disabled in PLAN MODE and will keep failing. Do not call it again. Describe this step in the plan instead, and output the finished numbered plan as text - the code is written only after the plan is approved.", name)
 	}
 
-	if err := a.enforceWorkspace(name, args); err != "" {
+	if err := a.enforceWorkspace(args); err != "" {
 		return err
 	}
 
