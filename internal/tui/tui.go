@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/alecthomas/chroma/v2/formatters"
 	"github.com/alecthomas/chroma/v2/lexers"
@@ -23,10 +24,11 @@ import (
 )
 
 const (
-	maxLogLines   = 2000
-	maxTreeNodes  = 600
-	maxTreeDepth  = 6
-	inputSentinel = "\x00tinycode-quit\x00"
+	maxLogLines     = 2000
+	maxTreeNodes    = 600
+	maxTreeDepth    = 6
+	wheelScrollStep = 3
+	inputSentinel   = "\x00tinycode-quit\x00"
 )
 
 // ---------- styling ----------
@@ -173,10 +175,17 @@ type model struct {
 	treeScroll int
 	treeFocus  bool
 
+	fileIndex []fileRef
+
 	answerCh    chan string
 	input       *input
 	inputActive bool
+	sideMode    bool
 	prompt      string
+	ac          *autocomplete
+
+	lastClickNode *treeNode
+	lastClickAt   time.Time
 
 	width, height int
 	ready         bool
@@ -191,7 +200,9 @@ func newModel(cfg *config.Config) *model {
 			cfg.LM.Name, cfg.TN.Workspace, cfg.TN.PermissionMode),
 	}
 	m.tree = buildTreeNodes(cfg.TN.Workspace)
+	m.fileIndex = buildFileIndex(m.tree, cfg.TN.Workspace)
 	m.treeSel = m.tree
+	m.ac = &autocomplete{fr: newFrecency(), build: m.acCandidates}
 	return m
 }
 
@@ -243,8 +254,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case enableInputMsg:
 		m.prompt = msg.prompt
 		m.inputActive = true
+		m.sideMode = false
 		m.input.Reset()
 		m.input.Focus()
+		m.ac.hide()
 		m.updateHint()
 		return m, nil
 
@@ -262,6 +275,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if m.inputActive {
+		if m.ac.active() {
+			switch msg.String() {
+			case "up", "ctrl+p":
+				m.ac.move(-1)
+				return nil
+			case "down", "ctrl+n":
+				m.ac.move(1)
+				return nil
+			case "tab":
+				return m.acComplete()
+			case "esc":
+				m.ac.hide()
+				return nil
+			}
+		}
 		switch msg.String() {
 		case "enter":
 			return m.submitInput()
@@ -273,20 +301,34 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.inputActive = false
 			m.input.Reset()
 			m.input.Blur()
+			m.ac.hide()
 			m.answerCh <- ""
 			return nil
 		default:
 			m.input.Update(msg)
+			m.ac.update(m.input.Value(), m.input.Cursor())
 			m.updateHint()
+			return nil
+		}
+	}
+
+	if m.sideMode {
+		switch msg.String() {
+		case "enter":
+			return m.submitSide()
+		case "ctrl+c":
+			return tea.Quit
+		case "esc":
+			m.exitSideMode()
+			return nil
+		default:
+			m.input.Update(msg)
 			return nil
 		}
 	}
 
 	switch msg.String() {
 	case "ctrl+c":
-		if m.inputActive {
-			m.answerCh <- inputSentinel
-		}
 		return tea.Quit
 	case "esc":
 		if m.agent != nil {
@@ -315,12 +357,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		case "left", "h":
 			m.treeLeft()
 		case "pgup":
-			m.treeScroll -= m.treeHeight()
-			if m.treeScroll < 0 {
-				m.treeScroll = 0
-			}
+			m.moveTreeSel(-m.treeHeight())
 		case "pgdown":
-			m.treeScroll += m.treeHeight()
+			m.moveTreeSel(m.treeHeight())
 		case "home":
 			m.treeSel = m.tree
 			m.treeScroll = 0
@@ -351,6 +390,13 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "pgdown":
 		m.logScroll += m.logHeight()
 		return nil
+	}
+
+	if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+		m.sideMode = true
+		m.input.Reset()
+		m.input.Focus()
+		m.input.Update(msg)
 	}
 	return nil
 }
@@ -409,7 +455,8 @@ func resolveSlash(value string) (string, bool) {
 }
 
 func (m *model) submitInput() tea.Cmd {
-	value := strings.TrimSpace(m.input.Value())
+	raw := strings.TrimSpace(m.input.Value())
+	value := raw
 
 	if strings.HasPrefix(value, "/") {
 		resolved, ok := resolveSlash(value)
@@ -419,16 +466,97 @@ func (m *model) submitInput() tea.Cmd {
 			return nil
 		}
 		value = resolved
+	} else if !strings.HasPrefix(value, "!") {
+		value = resolveMentions(value, m.cfg.TN.Workspace)
 	}
 
 	m.input.Reset()
 	m.input.Blur()
 	m.inputActive = false
+	m.ac.hide()
 	if value != "" {
-		m.appendLog(">>> " + value)
+		m.appendLog(">>> " + raw)
 	}
 	m.prompt = ""
 	m.answerCh <- value
+	return nil
+}
+
+// exitSideMode leaves the /btw side-question input without submitting.
+func (m *model) exitSideMode() {
+	m.sideMode = false
+	m.input.Reset()
+	m.input.Blur()
+}
+
+// parseBtw extracts the question from a /btw value. ok is false when the value
+// is not a valid /btw request.
+func parseBtw(value string) (string, bool) {
+	v := strings.TrimSpace(value)
+	if !strings.HasPrefix(v, "/btw") {
+		return "", false
+	}
+	q := strings.TrimSpace(strings.TrimPrefix(v, "/btw"))
+	if q == "" {
+		return "", false
+	}
+	return q, true
+}
+
+// submitSide routes a side-question submission while the agent is busy. It
+// never touches answerCh (the main loop is not reading it mid-turn).
+func (m *model) submitSide() tea.Cmd {
+	raw := strings.TrimSpace(m.input.Value())
+	m.exitSideMode()
+
+	if raw == "" {
+		return nil
+	}
+	q, ok := parseBtw(raw)
+	if !ok {
+		m.appendLog("[/btw] — введите: /btw <вопрос>")
+		return nil
+	}
+	m.appendLog("/btw " + q)
+	go m.runSideQuestion(q)
+	return nil
+}
+
+// runSideQuestion answers a side question off the UI loop and streams the
+// result into the log panel. Send on a finished program is a safe no-op.
+func (m *model) runSideQuestion(q string) {
+	m.program.Send(statusMsg{text: "→ отвечаю на /btw…"})
+	answer := strings.TrimSpace(m.agent.RunSideQuestion(q))
+	m.program.Send(statusMsg{text: ""})
+	if answer == "" {
+		m.program.Send(logMsg{line: "  [/btw] нет ответа"})
+		return
+	}
+	for _, line := range strings.Split(answer, "\n") {
+		m.program.Send(logMsg{line: line})
+	}
+}
+
+// acComplete replaces the mention/command being typed with the selected
+// option, then closes the menu.
+func (m *model) acComplete() tea.Cmd {
+	o, ok := m.ac.selectedOption()
+	if !ok {
+		return nil
+	}
+	runes := []rune(m.input.Value())
+	index := m.ac.index
+	cursor := m.input.Cursor()
+	if index < 0 || index > cursor || cursor > len(runes) {
+		m.ac.hide()
+		return nil
+	}
+	m.input.SetValue(string(runes[:index]) + o.Value + string(runes[cursor:]))
+	if o.Path != "" {
+		m.ac.fr.touch(o.Path)
+	}
+	m.ac.hide()
+	m.updateHint()
 	return nil
 }
 
@@ -443,9 +571,16 @@ func (m *model) appendLog(line string) {
 }
 
 func (m *model) inputBlockHeight() int {
-	lines := 1 // input line (or idle placeholder)
-	if m.inputActive && m.prompt != "" {
-		lines += strings.Count(m.prompt, "\n") + 1
+	lines := 1 // input line
+	if m.inputActive {
+		if n := len(m.ac.options); n > 0 {
+			lines += n + 2 // autocomplete menu block with border
+		}
+		if m.prompt != "" {
+			lines += strings.Count(m.prompt, "\n") + 1
+		}
+	} else {
+		lines++ // busy hint line (side-question prompt)
 	}
 	if m.input.Error() != "" {
 		lines++
@@ -548,16 +683,24 @@ func (m *model) View() string {
 }
 
 // inputView renders the dedicated input block (prompt, input line with inline
-// gray completion, and an optional inline error).
+// gray completion, and an optional inline error). The input box is always
+// rendered so a side question can be typed while the agent is busy.
 func (m *model) inputView() string {
 	var lines []string
 	if m.inputActive {
+		if ac := m.ac.View(m.width - 4); ac != "" {
+			lines = append(lines, ac)
+		}
 		if m.prompt != "" {
 			lines = append(lines, stylePrompt.Render(strings.TrimRight(m.prompt, "\n")))
 		}
 		lines = append(lines, m.input.View())
+	} else if m.sideMode {
+		lines = append(lines, styleHint.Render("/btw — введите вопрос (Enter — отправить, Esc — отмена)"))
+		lines = append(lines, m.input.View())
 	} else {
-		lines = append(lines, styleHint.Render("Спросите агента… (Enter — ввод)"))
+		lines = append(lines, m.input.View())
+		lines = append(lines, styleHint.Render("Агент работает… начните вводить /btw <вопрос>, чтобы спросить мимоходом"))
 	}
 	if e := m.input.Error(); e != "" {
 		lines = append(lines, styleErr.Render("  ✗ "+e))
@@ -672,6 +815,36 @@ type treeLine struct {
 	depth int
 }
 
+// fileRef is a workspace file or directory collected from the tree for @
+// mention candidates.
+type fileRef struct {
+	rel   string
+	abs   string
+	isDir bool
+}
+
+// buildFileIndex collects every file and directory node in the tree (already
+// filtered by EXCLUDE_DIRS and hidden names) into a flat candidate list.
+func buildFileIndex(root *treeNode, workspace string) []fileRef {
+	var out []fileRef
+	var walk func(n *treeNode)
+	walk = func(n *treeNode) {
+		if n != root {
+			rel, err := filepath.Rel(workspace, n.path)
+			if err == nil {
+				out = append(out, fileRef{rel: filepath.ToSlash(rel), abs: n.path, isDir: n.isDir})
+			}
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	if root != nil {
+		walk(root)
+	}
+	return out
+}
+
 func buildTreeNodes(root string) *treeNode {
 	n := &treeNode{name: filepath.Base(root), path: root, isDir: true, expanded: true}
 	count := 0
@@ -736,6 +909,7 @@ func (m *model) treeLines() []treeLine {
 
 func (m *model) rebuildTree() {
 	m.tree = buildTreeNodes(m.cfg.TN.Workspace)
+	m.fileIndex = buildFileIndex(m.tree, m.cfg.TN.Workspace)
 	m.treeSel = m.tree
 	m.treeScroll = 0
 }
@@ -778,10 +952,31 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if msg.Action != tea.MouseActionPress {
 		return nil
 	}
-	if msg.Button != tea.MouseButtonLeft {
+	if !m.ready {
 		return nil
 	}
-	if !m.ready {
+
+	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+		leftW, rightW := m.sideWidths()
+		if msg.X < leftW || msg.X >= leftW+rightW {
+			return nil
+		}
+		topY, innerHeight, ok := m.treePanelGeometry()
+		if !ok {
+			return nil
+		}
+		if msg.Y < topY || msg.Y >= topY+innerHeight {
+			return nil
+		}
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.moveTreeSel(-wheelScrollStep)
+		} else {
+			m.moveTreeSel(wheelScrollStep)
+		}
+		return nil
+	}
+
+	if msg.Button != tea.MouseButtonLeft {
 		return nil
 	}
 
@@ -806,10 +1001,40 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 
 	node := lines[idx].node
+	if !node.isDir && m.lastClickNode == node && time.Since(m.lastClickAt) < 500*time.Millisecond {
+		m.lastClickNode = nil
+		m.lastClickAt = time.Time{}
+		return m.insertMention(node)
+	}
+	m.lastClickNode = node
+	m.lastClickAt = time.Now()
 	m.treeSel = node
 	if node.isDir {
 		node.expanded = !node.expanded
 	}
+	return nil
+}
+
+// insertMention inserts an @path mention for a file into the input, activating
+// the input first when it is not yet active.
+func (m *model) insertMention(n *treeNode) tea.Cmd {
+	if n.isDir {
+		return nil
+	}
+	rel, err := filepath.Rel(m.cfg.TN.Workspace, n.path)
+	if err != nil {
+		return nil
+	}
+	mention := "@" + filepath.ToSlash(rel) + " "
+	if !m.inputActive {
+		m.prompt = ""
+		m.inputActive = true
+		m.input.Reset()
+		m.input.Focus()
+	}
+	m.input.SetValue(m.input.Value() + mention)
+	m.input.Focus()
+	m.ac.hide()
 	return nil
 }
 

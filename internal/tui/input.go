@@ -26,6 +26,7 @@ type input struct {
 func newInput() *input { return &input{} }
 
 func (i *input) Value() string { return string(i.value) }
+func (i *input) Cursor() int   { return i.cursor }
 
 func (i *input) SetValue(s string) {
 	i.value = []rune(s)

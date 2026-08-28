@@ -276,6 +276,8 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 
 // updateStoredContent syncs the cleaned assistant content back into history.
 func (a *Agent) updateStoredContent(original, cleaned string) {
+	a.msgMu.Lock()
+	defer a.msgMu.Unlock()
 	if n := len(a.messages); n > 0 {
 		last := &a.messages[n-1]
 		if last.Role == "assistant" && last.Content == original && len(last.ToolCalls) == 0 {
@@ -522,7 +524,7 @@ func (a *Agent) compactMessages() {
 // SlashCommands lists the built-in slash commands (for the TUI autocomplete
 // hint and validation).
 var SlashCommands = []string{
-	"/help", "/session", "/sessions", "/clear", "/new", "/plan", "/compact", "/exit",
+	"/help", "/session", "/sessions", "/clear", "/new", "/plan", "/compact", "/btw", "/exit",
 }
 
 const helpText = `
@@ -536,6 +538,7 @@ Commands:
   /new                  Start a new session (previous one is saved)
   /plan [desc]          Enter plan mode (analyze first, then act)
   /compact              Summarize and shrink context
+  /btw <question>       Ask a side question without interrupting the agent
   /exit                 End session
 
   ! <command>           Run a shell command directly
@@ -681,6 +684,20 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 
 	case c == "/compact":
 		a.compactMessages()
+		return true, false
+
+	case strings.HasPrefix(c, "/btw"):
+		question := strings.TrimSpace(strings.TrimPrefix(c, "/btw"))
+		if question == "" {
+			a.io.Println("  Usage: /btw <question>\n")
+			return true, false
+		}
+		answer := a.RunSideQuestion(question)
+		if answer == "" {
+			a.io.Println("  [/btw] нет ответа\n")
+		} else {
+			a.io.Println(fmt.Sprintf("  [/btw]\n%s\n", answer))
+		}
 		return true, false
 
 	case strings.HasPrefix(c, "!"):

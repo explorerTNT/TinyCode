@@ -25,6 +25,7 @@ func Default() *Config {
 			ContextLimit:      26000,
 			MaxToolRounds:     50,
 			PlanTokens:        1536,
+			BtwMaxTokens:      1024,
 			Temperature:       0.6,
 			ActionTemperature: 0.1,
 			PermissionMode:    "ask",

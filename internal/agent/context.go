@@ -56,16 +56,28 @@ func (c *ContextManager) pushAll(msgs []Message) {
 // trim drops the oldest messages (after the system prompt) that no longer fit,
 // keeping a placeholder marker. Returns the trimmed message list.
 func (c *ContextManager) trim(messages []Message) []Message {
+	result := trimMessages(messages, c.maxTokens, c.reserve)
+	c.estimated = 0
+	for _, m := range result {
+		c.estimated += countMessageTokens(m)
+	}
+	return result
+}
+
+// trimMessages is the pure core of trim: it returns a trimmed message list
+// without touching any shared ContextManager state, so a side-question snapshot
+// can trim its copy without racing the main loop.
+func trimMessages(messages []Message, maxTokens, reserve int) []Message {
 	if len(messages) == 0 {
 		return messages
 	}
 
-	budget := c.maxTokens - c.reserve
-	c.estimated = 0
+	budget := maxTokens - reserve
+	total := 0
 	for _, m := range messages {
-		c.estimated += countMessageTokens(m)
+		total += countMessageTokens(m)
 	}
-	if c.estimated < budget {
+	if total < budget {
 		return messages
 	}
 
@@ -73,15 +85,15 @@ func (c *ContextManager) trim(messages []Message) []Message {
 	rest := messages[1:]
 
 	marker := Message{Role: "system", Content: "[earlier context trimmed]"}
-	total := countMessageTokens(system) + countMessageTokens(marker)
+	keptTotal := countMessageTokens(system) + countMessageTokens(marker)
 	var picked []Message
 	for i := len(rest) - 1; i >= 0; i-- {
 		t := countMessageTokens(rest[i])
-		if total+t > budget {
+		if keptTotal+t > budget {
 			break
 		}
 		picked = append(picked, rest[i])
-		total += t
+		keptTotal += t
 	}
 
 	dropped := len(rest) - len(picked)
@@ -94,10 +106,6 @@ func (c *ContextManager) trim(messages []Message) []Message {
 	}
 	kept = append(kept, picked...)
 
-	c.estimated = 0
-	for _, m := range kept {
-		c.estimated += countMessageTokens(m)
-	}
 	return kept
 }
 

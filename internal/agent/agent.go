@@ -68,6 +68,7 @@ type Agent struct {
 
 	aborted atomic.Bool
 	mu      sync.Mutex
+	msgMu   sync.RWMutex
 	cancel  context.CancelFunc
 }
 
@@ -133,6 +134,8 @@ func (a *Agent) ModelName() string { return a.config.LM.Name }
 // TokenCounts returns approximate prompt and completion token counts.
 func (a *Agent) TokenCounts() (int, int) {
 	prompt, completion := 0, 0
+	a.msgMu.RLock()
+	defer a.msgMu.RUnlock()
 	for _, m := range a.messages {
 		n := countMessageTokens(m)
 		switch m.Role {
@@ -217,13 +220,32 @@ func (a *Agent) envState() string {
 }
 
 func (a *Agent) addMsg(m Message) {
+	a.msgMu.Lock()
+	defer a.msgMu.Unlock()
 	a.messages = append(a.messages, m)
 	a.ctx.push(m)
 }
 
 func (a *Agent) clearMessages() {
+	a.msgMu.Lock()
+	defer a.msgMu.Unlock()
 	a.messages = nil
 	a.ctx.reset()
+}
+
+// snapshotMessages returns a deep copy of the current message history without
+// holding the lock across any further work.
+func (a *Agent) snapshotMessages() []Message {
+	a.msgMu.RLock()
+	defer a.msgMu.RUnlock()
+	out := make([]Message, len(a.messages))
+	for i, m := range a.messages {
+		out[i] = m
+		if len(m.ToolCalls) > 0 {
+			out[i].ToolCalls = append([]ToolCall{}, m.ToolCalls...)
+		}
+	}
+	return out
 }
 
 // maybeGitHint injects a concrete git command when the user asks about history.

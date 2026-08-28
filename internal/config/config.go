@@ -17,6 +17,7 @@ type TNConfig struct {
 	ContextLimit      int     `json:"context_limit"      env:"TINYCODE_CONTEXT_LIMIT"`
 	MaxToolRounds     int     `json:"max_tool_rounds"    env:"TINYCODE_MAX_TOOL_ROUNDS"`
 	PlanTokens        int     `json:"plan_tokens"        env:"TINYCODE_PLAN_TOKENS"`
+	BtwMaxTokens      int     `json:"btw_max_tokens"     env:"TINYCODE_BTW_MAX_TOKENS"`
 	Temperature       float64 `json:"temperature"        env:"TINYCODE_TEMPERATURE"`
 	ActionTemperature float64 `json:"action_temperature" env:"TINYCODE_ACTION_TEMPERATURE"`
 	PermissionMode    string  `json:"permission_mode"    env:"TINYCODE_PERMISSION_MODE"`

@@ -15,6 +15,7 @@ import (
 
 type callOptions struct {
 	spinnerMessage string
+	spinner        bool
 	silent         bool
 	forcePrompt    string
 	maxTokens      int
@@ -29,9 +30,48 @@ type streamToolCall struct {
 }
 
 // callLLM streams one completion and returns the built assistant message, or
-// nil on any error (which is printed to the reporter).
+// nil on any error (which is printed to the reporter). It owns the agent-level
+// side effects: spinner, cancel registration, call counter, and the single
+// history append.
 func (a *Agent) callLLM(o callOptions) *Message {
-	messages := clearOldToolResults(a.ctx.trim(a.messages), keepFullToolResults)
+	ctx, cancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.cancel = cancel
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.cancel = nil
+		a.mu.Unlock()
+		cancel()
+	}()
+
+	o.spinner = true
+
+	if !o.silent {
+		a.llmCalls++
+		a.io.Status(fmt.Sprintf("  [#%d модель думает…]", a.llmCalls))
+	}
+
+	msg := a.streamCompletion(ctx, a.prepareMessages(), o)
+
+	if msg != nil && (msg.Content != "" || len(msg.ToolCalls) > 0) {
+		a.addMsg(*msg)
+	}
+	return msg
+}
+
+// prepareMessages returns a trimmed, tool-result-cleared snapshot of the
+// conversation history, ready to hand to streamCompletion.
+func (a *Agent) prepareMessages() []Message {
+	trimmed := trimMessages(a.snapshotMessages(), a.ctx.maxTokens, a.ctx.reserve)
+	return clearOldToolResults(trimmed, keepFullToolResults)
+}
+
+// streamCompletion streams one completion from already-prepared messages and
+// returns the built assistant message, or nil on error. It is stateless with
+// respect to the agent: no history mutation, no cancel registration, no call
+// counter, no status output when silent.
+func (a *Agent) streamCompletion(ctx context.Context, messages []Message, o callOptions) *Message {
 	normalized := normalizeMessages(messages)
 
 	maxTokens := o.maxTokens
@@ -66,35 +106,25 @@ func (a *Agent) callLLM(o callOptions) *Message {
 		req.Messages = append(req.Messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: o.forcePrompt})
 	}
 
-	stopSpinner := a.startSpinner(o.spinnerMessage)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.mu.Lock()
-	a.cancel = cancel
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.cancel = nil
-		a.mu.Unlock()
-		cancel()
-	}()
+	stopSpinner := func() {}
+	if o.spinner {
+		stopSpinner = a.startSpinner(o.spinnerMessage)
+	}
 
 	stream, err := a.client.CreateChatCompletionStream(ctx, req)
+	stopSpinner()
 	if err != nil {
-		stopSpinner()
 		a.reportStreamError(err)
 		return nil
 	}
-	stopSpinner()
+	defer stream.Close()
 
+	callNum := 0
 	if !o.silent {
-		a.llmCalls++
-		a.io.Status(fmt.Sprintf("  [#%d модель думает…]", a.llmCalls))
+		callNum = a.llmCalls
 	}
 
-	msg := a.processStream(stream, o.silent)
-	_ = stream.Close()
-	return msg
+	return a.processStream(ctx, stream, o.silent, callNum)
 }
 
 func (a *Agent) reportStreamError(err error) {
@@ -144,7 +174,7 @@ func (a *Agent) startSpinner(message string) func() {
 	}
 }
 
-func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) *Message {
+func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletionStream, silent bool, callNum int) *Message {
 	start := time.Now()
 	var content, reasoning strings.Builder
 	toolCalls := map[int]*streamToolCall{}
@@ -158,7 +188,7 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 			if err == io.EOF {
 				break
 			}
-			if errors.Is(err, context.Canceled) && a.aborted.Load() {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				return nil
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -172,8 +202,8 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 			}
 			return nil
 		}
-		if a.aborted.Load() {
-			break
+		if ctx.Err() != nil {
+			return nil
 		}
 		if chunk.Usage != nil {
 			usage = chunk.Usage
@@ -191,13 +221,13 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 		if delta.ReasoningContent != "" {
 			reasoning.WriteString(delta.ReasoningContent)
 			if !silent {
-				a.io.Status(fmt.Sprintf("  [#%d модель думает: %d ток • %.0fс]", a.llmCalls, reasoning.Len(), time.Since(start).Seconds()))
+				a.io.Status(fmt.Sprintf("  [#%d модель думает: %d ток • %.0fс]", callNum, reasoning.Len(), time.Since(start).Seconds()))
 			}
 		}
 		if delta.Content != "" {
 			content.WriteString(delta.Content)
 			if !silent {
-				a.io.Status(fmt.Sprintf("  [#%d модель отвечает: %d ток • %.0fс]", a.llmCalls, content.Len(), time.Since(start).Seconds()))
+				a.io.Status(fmt.Sprintf("  [#%d модель отвечает: %d ток • %.0fс]", callNum, content.Len(), time.Since(start).Seconds()))
 			}
 			if content.Len() > 600 {
 				lowered := strings.ToLower(content.String())
@@ -211,7 +241,7 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 		}
 		if len(delta.ToolCalls) > 0 {
 			if !silent {
-				a.io.Status(fmt.Sprintf("  [#%d модель готовит вызов инструмента…]", a.llmCalls))
+				a.io.Status(fmt.Sprintf("  [#%d модель готовит вызов инструмента…]", callNum))
 			}
 			for _, tc := range delta.ToolCalls {
 				idx := 0
@@ -236,7 +266,7 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 		}
 	}
 
-	if a.aborted.Load() {
+	if ctx.Err() != nil {
 		return nil
 	}
 
@@ -249,11 +279,11 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 		var summary string
 		switch {
 		case len(toolCalls) > 0:
-			summary = fmt.Sprintf("\r  [#%d вызов инструмента • %s • %.0fс]", a.llmCalls, tok, elapsed)
+			summary = fmt.Sprintf("\r  [#%d вызов инструмента • %s • %.0fс]", callNum, tok, elapsed)
 		case reasoning.Len()+content.Len() > 0:
-			summary = fmt.Sprintf("\r  [#%d модель • %s • %.0fс]", a.llmCalls, tok, elapsed)
+			summary = fmt.Sprintf("\r  [#%d модель • %s • %.0fс]", callNum, tok, elapsed)
 		default:
-			summary = fmt.Sprintf("\r  [#%d пусто • %.0fс]", a.llmCalls, elapsed)
+			summary = fmt.Sprintf("\r  [#%d пусто • %.0fс]", callNum, elapsed)
 		}
 		a.io.Println(summary)
 	}
@@ -266,23 +296,19 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 	}
 
 	if len(toolCalls) > 0 {
-		if result := a.buildFromStream(content.String(), toolCalls, finishReason); result != nil {
+		if result := buildFromStream(content.String(), toolCalls, finishReason); result != nil {
 			return result
 		}
 	}
 
 	if len(toolCalls) == 0 && content.Len() > 0 {
 		if parsed := parseXMLToolCalls(content.String()); parsed != nil {
-			msg := &Message{Role: "assistant", Content: content.String(), ToolCalls: parsed}
-			a.addMsg(*msg)
-			return msg
+			return &Message{Role: "assistant", Content: content.String(), ToolCalls: parsed}
 		}
 	}
 
 	if content.Len() > 0 {
-		msg := &Message{Role: "assistant", Content: content.String()}
-		a.addMsg(*msg)
-		return msg
+		return &Message{Role: "assistant", Content: content.String()}
 	}
 
 	if reasoning.Len() > 0 {
@@ -292,7 +318,7 @@ func (a *Agent) processStream(stream *openai.ChatCompletionStream, silent bool) 
 	return nil
 }
 
-func (a *Agent) buildFromStream(content string, toolCalls map[int]*streamToolCall, finish openai.FinishReason) *Message {
+func buildFromStream(content string, toolCalls map[int]*streamToolCall, finish openai.FinishReason) *Message {
 	keys := make([]int, 0, len(toolCalls))
 	for k := range toolCalls {
 		keys = append(keys, k)
@@ -335,7 +361,5 @@ func (a *Agent) buildFromStream(content string, toolCalls map[int]*streamToolCal
 		return nil
 	}
 
-	msg := &Message{Role: "assistant", Content: content, ToolCalls: built, Truncated: truncated}
-	a.addMsg(*msg)
-	return msg
+	return &Message{Role: "assistant", Content: content, ToolCalls: built, Truncated: truncated}
 }
