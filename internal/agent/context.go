@@ -53,20 +53,10 @@ func (c *ContextManager) pushAll(msgs []Message) {
 	}
 }
 
-// trim drops the oldest messages (after the system prompt) that no longer fit,
-// keeping a placeholder marker. Returns the trimmed message list.
-func (c *ContextManager) trim(messages []Message) []Message {
-	result := trimMessages(messages, c.maxTokens, c.reserve)
-	c.estimated = 0
-	for _, m := range result {
-		c.estimated += countMessageTokens(m)
-	}
-	return result
-}
-
-// trimMessages is the pure core of trim: it returns a trimmed message list
-// without touching any shared ContextManager state, so a side-question snapshot
-// can trim its copy without racing the main loop.
+// trimMessages drops the oldest messages (after the system prompt) that no
+// longer fit, keeping a placeholder marker. It touches no shared
+// ContextManager state, so a side-question snapshot can trim its own copy
+// without racing the main loop.
 func trimMessages(messages []Message, maxTokens, reserve int) []Message {
 	if len(messages) == 0 {
 		return messages
