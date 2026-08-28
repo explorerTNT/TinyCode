@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/explorerTNT/TinyCode/internal/i18n"
 )
 
 var (
@@ -102,26 +104,26 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 
 	for rnd := 0; rnd < maxRounds; rnd++ {
 		if a.aborted.Load() {
-			a.io.Println("\n  [прервано пользователем]\n")
+			a.io.Println(i18n.T("agent.interrupted"))
 			return
 		}
 		isLast := rnd == maxRounds-1
 
 		msg := a.callLLM(callOptions{silent: silent, useTools: !isLast})
 		if a.aborted.Load() {
-			a.io.Println("\n  [прервано пользователем]\n")
+			a.io.Println(i18n.T("agent.interrupted"))
 			return
 		}
 		if msg == nil {
 			msg = a.callLLM(callOptions{silent: silent, forcePrompt: "Continue with the next step."})
 			if msg == nil {
-				a.io.Println("\n  [model did not respond, stopping]\n")
+				a.io.Println(i18n.T("agent.no_response"))
 				return
 			}
 		}
 
 		if len(msg.ToolCalls) == 0 && msg.Content == "" {
-			a.io.Println(fmt.Sprintf("  [%d/%d] (empty reply, retrying without thinking)", rnd+1, maxRounds))
+			a.io.Println(i18n.T("agent.empty_reply", rnd+1, maxRounds))
 			retry := a.callLLM(callOptions{
 				silent: silent, useTools: !isLast, noThinking: true,
 				forcePrompt: "Your previous response was empty. Output the next tool call now, without thinking.",
@@ -140,7 +142,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 			repeatCount = 0
 			textOnlyRounds = 0
 			if len(tcList) > maxCallsPerRound {
-				a.io.Println(fmt.Sprintf("  [%d tool calls in one reply, keeping the first %d]", len(tcList), maxCallsPerRound))
+				a.io.Println(i18n.T("agent.too_many_calls", len(tcList), maxCallsPerRound))
 				tcList = tcList[:maxCallsPerRound]
 			}
 			for _, tc := range tcList {
@@ -159,7 +161,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 					return
 				}
 
-				a.io.Println(fmt.Sprintf("  [%d/%d tool: %s(%s)]", rnd+1, maxRounds, name, shortArgs(args, 60)))
+				a.io.Println(i18n.T("agent.tool_line", rnd+1, maxRounds, name, shortArgs(args, 60)))
 
 				var result string
 				if msg.Truncated && (name == writeToolsFile || name == editToolsFile) {
@@ -169,7 +171,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 				}
 
 				if strings.HasPrefix(result, "Error:") {
-					a.io.Println(fmt.Sprintf("  !!! %s", result))
+				a.io.Println(i18n.T("agent.tool_error", result))
 					recentErrors = append(recentErrors, fmt.Sprintf("%s: %s", name, truncateStr(result, 200)))
 					if len(recentErrors) > 8 {
 						recentErrors = recentErrors[1:]
@@ -177,7 +179,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 				} else {
 					didWork = true
 					preview := strings.ReplaceAll(truncateStr(result, 120), "\n", " ")
-					a.io.Println(fmt.Sprintf("  -> result (%dc): %s", len(result), preview))
+					a.io.Println(i18n.T("agent.tool_result", len(result), preview))
 				}
 
 				if len(result) > toolResultCap {
@@ -205,7 +207,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 					}
 				}
 				if same >= 3 || sameTool >= 6 {
-					a.io.Println("  [repeating same tool, recovery prompt]")
+					a.io.Println(i18n.T("agent.repeating_tool"))
 					seen := dedupStrings(recentErrors)
 					if len(seen) > 4 {
 						seen = seen[len(seen)-4:]
@@ -218,13 +220,13 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 			}
 		} else if content != "" {
 			if msg.Cut == "repetition" {
-				a.io.Println("  [task finished: model repeated the answer]\n")
+				a.io.Println(i18n.T("agent.finished_repeat"))
 				return
 			}
 			cleanContent := stripXMLToolCalls(content)
 			if cleanContent != "" {
 				preview := strings.ReplaceAll(truncateStr(cleanContent, 300), "\n", " ")
-				a.io.Println(fmt.Sprintf("  [%d/%d] %s", rnd+1, maxRounds, preview))
+					a.io.Println(i18n.T("agent.round", rnd+1, maxRounds, preview))
 				msg.Content = cleanContent
 				a.updateStoredContent(content, cleanContent)
 
@@ -236,7 +238,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 					lastContentNorm = norm
 				}
 				if repeatCount >= 2 {
-					a.io.Println("  [model repeating same answer, stopping]\n")
+					a.io.Println(i18n.T("agent.repeating_answer"))
 					return
 				}
 			}
@@ -247,7 +249,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 			}
 
 			if didWork && textOnlyRounds >= 1 {
-				a.io.Println("  [model answered in text twice, treating as done]\n")
+				a.io.Println(i18n.T("agent.text_twice"))
 				return
 			}
 
@@ -256,13 +258,13 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 		} else {
 			reasoningRounds++
 			if reasoningRounds > 2 {
-				a.io.Println("\n  [model stuck in reasoning loop, stopping]\n")
+				a.io.Println(i18n.T("agent.stuck_reasoning"))
 				return
 			}
 		}
 	}
 
-	a.io.Println("\n  [max rounds reached, summarizing work...]")
+	a.io.Println(i18n.T("agent.max_rounds"))
 	msg := a.callLLM(callOptions{
 		silent:      true,
 		maxTokens:   512,
@@ -338,23 +340,23 @@ func truncateStr(s string, n int) string {
 var writeTools = map[string]bool{writeToolsFile: true, editToolsFile: true, runBashTool: true}
 
 func (a *Agent) processPlanTurn() {
-	a.io.Println("  [analyzing and creating plan...]")
+	a.io.Println(i18n.T("plan.analyzing"))
 	a.aborted.Store(false)
 	blockedWrites := 0
 	for rnd := 0; rnd < 3; rnd++ {
 		if a.aborted.Load() {
-			a.io.Println("\n  [прервано пользователем]\n")
+			a.io.Println(i18n.T("agent.interrupted"))
 			return
 		}
 		msg := a.callLLM(callOptions{silent: true, maxTokens: a.config.TN.PlanTokens})
 		if a.aborted.Load() {
-			a.io.Println("\n  [прервано пользователем]\n")
+			a.io.Println(i18n.T("agent.interrupted"))
 			return
 		}
 		if msg == nil {
 			msg = a.callLLM(callOptions{silent: true, forcePrompt: "Output your plan now. No more analysis needed.", maxTokens: a.config.TN.PlanTokens})
 			if msg == nil {
-				a.io.Println("  [model did not respond]\n")
+				a.io.Println(i18n.T("plan.no_response"))
 				return
 			}
 		}
@@ -389,16 +391,16 @@ func (a *Agent) processPlanTurn() {
 					return
 				}
 				result := "Error: empty plan. Write the numbered plan as the message."
-				a.io.Println(fmt.Sprintf("  !!! %s", result))
+				a.io.Println(i18n.T("agent.tool_error", result))
 				a.addMsg(Message{Role: "tool", ToolCallID: tc.ID, Content: result})
 				continue
 			}
 
-			a.io.Println(fmt.Sprintf("  [%d/25 tool: %s(%s)]", rnd+1, name, shortArgs(args, 60)))
+			a.io.Println(i18n.T("agent.tool_line", rnd+1, 25, name, shortArgs(args, 60)))
 			result := a.executeTool(name, args)
 
 			if strings.HasPrefix(result, "Error:") {
-				a.io.Println(fmt.Sprintf("  !!! %s", result))
+				a.io.Println(i18n.T("agent.tool_error", result))
 			}
 			a.addMsg(Message{Role: "tool", ToolCallID: tc.ID, Content: result})
 
@@ -422,7 +424,7 @@ func (a *Agent) processPlanTurn() {
 		a.showPlan(plan)
 	} else {
 		a.lastPlan = ""
-		a.io.Println("  [model did not create a plan]\n")
+		a.io.Println(i18n.T("plan.no_plan"))
 	}
 }
 
@@ -437,10 +439,10 @@ func (a *Agent) showPlan(plan string) {
 	a.lastPlan = plan
 	steps := countPlanSteps(plan)
 	if steps > 0 {
-		a.io.Println(fmt.Sprintf("  [plan has %d steps, allocating up to %d rounds]", steps, a.config.TN.MaxToolRounds))
+		a.io.Println(i18n.T("plan.steps", steps, a.config.TN.MaxToolRounds))
 	}
 	a.io.Println("\n" + strings.Repeat("=", 50))
-	a.io.Println("  PLAN")
+	a.io.Println(i18n.T("plan.title"))
 	a.io.Println(strings.Repeat("=", 50))
 	for _, line := range strings.Split(strings.TrimSpace(plan), "\n") {
 		a.io.Println(fmt.Sprintf("  %s", line))
@@ -453,12 +455,12 @@ func (a *Agent) showPlan(plan string) {
 
 func (a *Agent) handlePlanApproval() {
 	if strings.TrimSpace(a.lastPlan) == "" {
-		a.io.Println("  [no plan to approve - try /plan again]\n")
+		a.io.Println(i18n.T("plan.none"))
 		a.planMode = false
 		return
 	}
 
-	resp, err := a.io.Input("[Plan ready. Approve and execute? (y/n/edit)] ")
+	resp, err := a.io.Input(i18n.T("plan.approve_prompt"))
 	if err != nil {
 		resp = "n"
 	}
@@ -475,10 +477,10 @@ func (a *Agent) handlePlanApproval() {
 		a.processTurn(0, false)
 		a.io.Println("")
 	case "edit":
-		a.io.Println("  [Edit the plan and say 'continue']\n")
+		a.io.Println(i18n.T("plan.edit"))
 		a.planMode = true
 	default:
-		a.io.Println("  [Plan rejected. Type /plan again or give feedback.]\n")
+		a.io.Println(i18n.T("plan.rejected"))
 		a.planMode = false
 		a.lastPlan = ""
 	}
@@ -488,7 +490,7 @@ func (a *Agent) handlePlanApproval() {
 
 func (a *Agent) compactMessages() {
 	if len(a.messages) <= 2 {
-		a.io.Println("  [nothing to compact]\n")
+		a.io.Println(i18n.T("compact.nothing"))
 		return
 	}
 
@@ -515,7 +517,7 @@ func (a *Agent) compactMessages() {
 	a.clearMessages()
 	a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
 	a.addMsg(Message{Role: "user", Content: "Summary of the previous conversation:\n" + summary})
-	a.io.Println("  [context compacted: model summary]\n")
+	a.io.Println(i18n.T("compact.done"))
 }
 
 // ---- command handling ----
@@ -525,25 +527,6 @@ func (a *Agent) compactMessages() {
 var SlashCommands = []string{
 	"/help", "/session", "/sessions", "/clear", "/new", "/plan", "/compact", "/btw", "/exit",
 }
-
-const helpText = `
-Commands:
-  /help                 Show this help
-  /session save [name]  Save the current session
-  /session load [name]  Load a session (last one if no name given)
-  /session list         List saved sessions
-  /sessions             Same as /session list
-  /clear                Clear conversation, start fresh
-  /new                  Start a new session (previous one is saved)
-  /plan [desc]          Enter plan mode (analyze first, then act)
-  /compact              Summarize and shrink context
-  /btw <question>       Ask a side question without interrupting the agent
-  /exit                 End session
-
-  ! <command>           Run a shell command directly
-
-  Ctrl+C to interrupt.
-`
 
 // handleSessionCommand returns true if the input was a session command.
 func (a *Agent) handleSessionCommand(cmd string) bool {
@@ -578,9 +561,9 @@ func (a *Agent) handleSessionCommand(cmd string) bool {
 			}
 			path, err := a.sessions.save(name, a.messages, a.planMode, a.config.LM.Name, a.workspace)
 			if err != nil {
-				a.io.Println(fmt.Sprintf("  [session save failed: %v]\n", err))
+				a.io.Println(i18n.T("session.save_failed", err))
 			} else {
-				a.io.Println(fmt.Sprintf("  [session saved: %s]\n", filepath.Base(path)))
+				a.io.Println(i18n.T("session.saved", filepath.Base(path)))
 			}
 			return true
 
@@ -589,7 +572,7 @@ func (a *Agent) handleSessionCommand(cmd string) bool {
 			if name == "" {
 				name = a.sessions.lastSession()
 				if name == "" {
-					a.io.Println("  [no sessions to resume]\n")
+					a.io.Println(i18n.T("session.none_to_resume"))
 					return true
 				}
 			}
@@ -603,14 +586,14 @@ func (a *Agent) handleSessionCommand(cmd string) bool {
 				}
 			}
 			if err != nil || data == nil {
-				a.io.Println(fmt.Sprintf("  [session '%s' not found]\n", name))
+				a.io.Println(i18n.T("session.not_found", name))
 				return true
 			}
 			a.messages = data.Messages
 			a.planMode = data.PlanMode
 			a.ctx.reset()
 			a.ctx.pushAll(a.messages)
-			a.io.Println(fmt.Sprintf("  [resumed session: %s (%d messages)]\n", data.Name, len(a.messages)))
+			a.io.Println(i18n.T("session.resumed", data.Name, len(a.messages)))
 			return true
 
 		case "list":
@@ -618,7 +601,7 @@ func (a *Agent) handleSessionCommand(cmd string) bool {
 			return true
 
 		default:
-			a.io.Println("  Usage: /session save [name] | /session load [name] | /session list\n")
+			a.io.Println(i18n.T("session.usage"))
 			return true
 		}
 	}
@@ -629,10 +612,12 @@ func (a *Agent) handleSessionCommand(cmd string) bool {
 func (a *Agent) printSessionList() {
 	sessions := a.sessions.list()
 	if len(sessions) == 0 {
-		a.io.Println("  [no saved sessions]\n")
+		a.io.Println(i18n.T("session.list_empty"))
 		return
 	}
-	a.io.Println(fmt.Sprintf("\n  %-20s %-30s %-6s %s", "Name", "Model", "Msgs", "Time"))
+	a.io.Println(fmt.Sprintf("\n  %-20s %-30s %-6s %s",
+		i18n.T("session.list_header_name"), i18n.T("session.list_header_model"),
+		i18n.T("session.list_header_msgs"), i18n.T("session.list_header_time")))
 	a.io.Println(fmt.Sprintf("  %s", strings.Repeat("─", 60)))
 	for _, s := range sessions {
 		a.io.Println(fmt.Sprintf("  %-20s %-30s %-6d %s", s.Name, s.Model, s.Messages, s.Time))
@@ -646,11 +631,11 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 
 	switch {
 	case c == "/exit":
-		a.io.Println("bye!")
+		a.io.Println(i18n.T("agent.bye"))
 		return true, true
 
 	case c == "/help":
-		a.io.Println(helpText)
+		a.io.Println(i18n.T("help.text"))
 		return true, false
 
 	case c == "/clear":
@@ -658,7 +643,7 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
 		a.planMode = false
 		a.lastPlan = ""
-		a.io.Println("  [context cleared, fresh start]\n")
+		a.io.Println(i18n.T("session.cleared"))
 		return true, false
 
 	case c == "/new":
@@ -667,7 +652,7 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
 		a.planMode = false
 		a.lastPlan = ""
-		a.io.Println("  [new session — previous saved, context cleared]\n")
+		a.io.Println(i18n.T("session.new"))
 		return true, false
 
 	case strings.HasPrefix(c, "/plan"):
@@ -688,14 +673,14 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 	case strings.HasPrefix(c, "/btw"):
 		question := strings.TrimSpace(strings.TrimPrefix(c, "/btw"))
 		if question == "" {
-			a.io.Println("  Usage: /btw <question>\n")
+			a.io.Println(i18n.T("btw.usage"))
 			return true, false
 		}
 		answer := a.RunSideQuestion(question)
 		if answer == "" {
-			a.io.Println("  [/btw] нет ответа\n")
+			a.io.Println(i18n.T("btw.no_answer"))
 		} else {
-			a.io.Println(fmt.Sprintf("  [/btw]\n%s\n", answer))
+			a.io.Println(i18n.T("btw.result", answer))
 		}
 		return true, false
 
@@ -715,15 +700,15 @@ func (a *Agent) Run() {
 		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
 	}
 
-	a.io.Println(fmt.Sprintf("  tiny-code — model: %s", a.config.LM.Name))
-	a.io.Println(fmt.Sprintf("  workspace: %s", a.workspace))
-	a.io.Println(fmt.Sprintf("  permissions: %s", a.permissions.Mode().String()))
-	a.io.Println("  Type /help for commands. Ctrl+C to exit.\n")
+	a.io.Println(i18n.T("agent.banner_model", a.config.LM.Name))
+	a.io.Println(i18n.T("agent.banner_workspace", a.workspace))
+	a.io.Println(i18n.T("agent.banner_permissions", a.permissions.Mode().String()))
+	a.io.Println(i18n.T("agent.banner_help"))
 
 	for {
-		line, err := a.io.Input(">>> ")
+		line, err := a.io.Input(i18n.T("agent.input_prompt"))
 		if err != nil {
-			a.io.Println("\nbye!")
+			a.io.Println("\n" + i18n.T("agent.bye"))
 			return
 		}
 		userInput := strings.TrimSpace(line)
@@ -732,7 +717,7 @@ func (a *Agent) Run() {
 		}
 		switch strings.ToLower(userInput) {
 		case "exit", "quit":
-			a.io.Println("bye!")
+			a.io.Println(i18n.T("agent.bye"))
 			return
 		}
 
@@ -753,7 +738,7 @@ func (a *Agent) Run() {
 		}
 
 		if strings.HasPrefix(userInput, "/") {
-			a.io.Println(fmt.Sprintf("  [неизвестная команда: %s — введите /help]", userInput))
+			a.io.Println(i18n.T("agent.unknown_cmd", userInput))
 			continue
 		}
 

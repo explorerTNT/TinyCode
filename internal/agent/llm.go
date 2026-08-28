@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/sashabaranov/go-openai"
+
+	"github.com/explorerTNT/TinyCode/internal/i18n"
 )
 
 type callOptions struct {
@@ -49,7 +51,7 @@ func (a *Agent) callLLM(o callOptions) *Message {
 
 	if !o.silent {
 		a.llmCalls++
-		a.io.Status(fmt.Sprintf("  [#%d модель думает…]", a.llmCalls))
+		a.io.Status(i18n.T("llm.thinking", a.llmCalls))
 	}
 
 	msg := a.streamCompletion(ctx, a.prepareMessages(), o)
@@ -131,23 +133,23 @@ func (a *Agent) reportStreamError(err error) {
 	var apiErr *openai.APIError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		a.io.Println("\n  [Model stalled (90s timeout). Forcing continue.]")
+		a.io.Println(i18n.T("llm.stalled"))
 	case errors.As(err, &apiErr):
 		switch apiErr.HTTPStatusCode {
 		case 429:
-			a.io.Println("\n  [Error: Rate limited. Wait and try again.]")
+			a.io.Println(i18n.T("llm.rate_limited"))
 		default:
-			a.io.Println(fmt.Sprintf("\n  [Error: %s]", err))
+			a.io.Println(i18n.T("llm.error", err))
 		}
 	default:
-		a.io.Println(fmt.Sprintf("\n  [Error: Can't connect to the model server at http://%s:%d]", a.config.LM.Host, a.config.LM.Port))
-		a.io.Println(fmt.Sprintf("  [Make sure the server is running on port %d]\n", a.config.LM.Port))
+		a.io.Println(i18n.T("llm.cant_connect", a.config.LM.Host, a.config.LM.Port))
+		a.io.Println(i18n.T("llm.port_hint", a.config.LM.Port))
 	}
 }
 
 func (a *Agent) startSpinner(message string) func() {
 	if message == "" {
-		message = "жду ответа модели…"
+		message = i18n.T("llm.spinner_default")
 	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -193,12 +195,12 @@ func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletion
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
 				if !silent {
-					a.io.Println("\n  [Model stalled (90s timeout). Forcing continue.]")
+					a.io.Println(i18n.T("llm.stalled"))
 				}
 				return nil
 			}
 			if !silent {
-				a.io.Println(fmt.Sprintf("\n  [stream error: %v]", err))
+				a.io.Println(i18n.T("llm.stream_error", err))
 			}
 			return nil
 		}
@@ -221,13 +223,13 @@ func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletion
 		if delta.ReasoningContent != "" {
 			reasoning.WriteString(delta.ReasoningContent)
 			if !silent {
-				a.io.Status(fmt.Sprintf("  [#%d модель думает: %d ток • %.0fс]", callNum, reasoning.Len(), time.Since(start).Seconds()))
+				a.io.Status(i18n.T("llm.thinking_toks", callNum, reasoning.Len(), time.Since(start).Seconds()))
 			}
 		}
 		if delta.Content != "" {
 			content.WriteString(delta.Content)
 			if !silent {
-				a.io.Status(fmt.Sprintf("  [#%d модель отвечает: %d ток • %.0fс]", callNum, content.Len(), time.Since(start).Seconds()))
+				a.io.Status(i18n.T("llm.answering_toks", callNum, content.Len(), time.Since(start).Seconds()))
 			}
 			if content.Len() > 600 {
 				lowered := strings.ToLower(content.String())
@@ -241,7 +243,7 @@ func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletion
 		}
 		if len(delta.ToolCalls) > 0 {
 			if !silent {
-				a.io.Status(fmt.Sprintf("  [#%d модель готовит вызов инструмента…]", callNum))
+				a.io.Status(i18n.T("llm.preparing_tool", callNum))
 			}
 			for _, tc := range delta.ToolCalls {
 				idx := 0
@@ -272,25 +274,25 @@ func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletion
 
 	if !silent {
 		elapsed := time.Since(start).Seconds()
-		tok := fmt.Sprintf("%d симв", reasoning.Len()+content.Len())
+		tok := i18n.T("llm.tok_chars", reasoning.Len()+content.Len())
 		if usage != nil && usage.CompletionTokens > 0 {
-			tok = fmt.Sprintf("%d ток", usage.CompletionTokens)
+			tok = i18n.T("llm.tok_tokens", usage.CompletionTokens)
 		}
 		var summary string
 		switch {
 		case len(toolCalls) > 0:
-			summary = fmt.Sprintf("\r  [#%d вызов инструмента • %s • %.0fс]", callNum, tok, elapsed)
+			summary = i18n.T("llm.summary_tool", callNum, tok, elapsed)
 		case reasoning.Len()+content.Len() > 0:
-			summary = fmt.Sprintf("\r  [#%d модель • %s • %.0fс]", callNum, tok, elapsed)
+			summary = i18n.T("llm.summary_model", callNum, tok, elapsed)
 		default:
-			summary = fmt.Sprintf("\r  [#%d пусто • %.0fс]", callNum, elapsed)
+			summary = i18n.T("llm.summary_empty", callNum, elapsed)
 		}
 		a.io.Println(summary)
 	}
 
 	if repeated && len(toolCalls) == 0 {
 		if !silent {
-			a.io.Println("\n  [repetition detected, response cut]")
+			a.io.Println(i18n.T("llm.repetition"))
 		}
 		return &Message{Role: "assistant", Content: content.String(), Cut: "repetition"}
 	}

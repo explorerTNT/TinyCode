@@ -20,6 +20,7 @@ import (
 
 	"github.com/explorerTNT/TinyCode/internal/agent"
 	"github.com/explorerTNT/TinyCode/internal/config"
+	"github.com/explorerTNT/TinyCode/internal/i18n"
 	"github.com/explorerTNT/TinyCode/internal/tools"
 )
 
@@ -196,8 +197,7 @@ func newModel(cfg *config.Config) *model {
 		cfg:      cfg,
 		input:    newInput(),
 		answerCh: make(chan string, 1),
-		status: fmt.Sprintf("модель: %s\nworkspace: %s\nperms: %s",
-			cfg.LM.Name, cfg.TN.Workspace, cfg.TN.PermissionMode),
+		status: i18n.T("tui.model_status", cfg.LM.Name, cfg.TN.Workspace, cfg.TN.PermissionMode),
 	}
 	m.tree = buildTreeNodes(cfg.TN.Workspace)
 	m.fileIndex = buildFileIndex(m.tree, cfg.TN.Workspace)
@@ -333,7 +333,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "esc":
 		if m.agent != nil {
 			m.agent.Abort()
-			m.appendLog("[Esc] генерация остановлена — введите новый запрос или продолжите.")
+			m.appendLog(i18n.T("tui.esc_stopped"))
 		}
 		return nil
 	case "f2":
@@ -461,7 +461,7 @@ func (m *model) submitInput() tea.Cmd {
 	if strings.HasPrefix(value, "/") {
 		resolved, ok := resolveSlash(value)
 		if !ok {
-			m.input.SetError("команда не известна: " + value)
+			m.input.SetError(i18n.T("tui.cmd_unknown", value))
 			m.input.SetCompletion("")
 			return nil
 		}
@@ -514,7 +514,7 @@ func (m *model) submitSide() tea.Cmd {
 	}
 	q, ok := parseBtw(raw)
 	if !ok {
-		m.appendLog("[/btw] — введите: /btw <вопрос>")
+		m.appendLog(i18n.T("tui.btw_hint"))
 		return nil
 	}
 	m.appendLog("/btw " + q)
@@ -525,11 +525,11 @@ func (m *model) submitSide() tea.Cmd {
 // runSideQuestion answers a side question off the UI loop and streams the
 // result into the log panel. Send on a finished program is a safe no-op.
 func (m *model) runSideQuestion(q string) {
-	m.program.Send(statusMsg{text: "→ отвечаю на /btw…"})
+	m.program.Send(statusMsg{text: i18n.T("tui.btw_answering")})
 	answer := strings.TrimSpace(m.agent.RunSideQuestion(q))
 	m.program.Send(statusMsg{text: ""})
 	if answer == "" {
-		m.program.Send(logMsg{line: "  [/btw] нет ответа"})
+		m.program.Send(logMsg{line: i18n.T("tui.btw_no_answer")})
 		return
 	}
 	for _, line := range strings.Split(answer, "\n") {
@@ -642,15 +642,15 @@ func (m *model) logHeight() int {
 
 func (m *model) View() string {
 	if !m.ready {
-		return "loading…"
+		return i18n.T("tui.loading")
 	}
 
 	bodyH := m.bodyH()
 	leftW, rightW := m.sideWidths()
 
-	header := styleTitle.Render("tiny-code") + styleHint.Render(" — локальный AI-агент")
+	header := styleTitle.Render("tiny-code") + styleHint.Render(i18n.T("tui.subtitle"))
 	if m.agent != nil {
-		header += styleHint.Render(fmt.Sprintf(" · модель %s · %s", m.agent.ModelName(), m.agent.PermissionMode()))
+		header += styleHint.Render(i18n.T("tui.model_info", m.agent.ModelName(), m.agent.PermissionMode()))
 	}
 
 	log := styleLogBrd.Width(leftW).Height(bodyH).Render(m.scrolledLog(bodyH - 2))
@@ -662,12 +662,12 @@ func (m *model) View() string {
 		treeH = 0
 	}
 
-	status := styleSideBrd.Width(rightW).Height(statusH - 2).Render(" статус\n" + styleStatus.Render(m.status))
+	status := styleSideBrd.Width(rightW).Height(statusH - 2).Render(i18n.T("tui.status_label") + "\n" + styleStatus.Render(m.status))
 	side := status
 	if treeH >= 2 {
-		title := " файлы"
+		title := i18n.T("tui.files")
 		if m.treeFocus {
-			title = " файлы [активно]"
+			title = i18n.T("tui.files_active")
 		}
 		tree := styleSideBrd.Width(rightW).Height(treeH - 2).Render(title + "\n" + m.treeContent(rightW-2, treeH-3))
 		side = lipgloss.JoinVertical(lipgloss.Left, status, tree)
@@ -677,7 +677,7 @@ func (m *model) View() string {
 
 	inputBlock := m.inputView()
 
-	footer := styleHint.Render("Tab — файлы · Enter — отправить · Esc — остановить · ↑/↓ — скролл · Ctrl+C — выход")
+	footer := styleHint.Render(i18n.T("tui.footer"))
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, inputBlock, footer)
 }
@@ -696,11 +696,11 @@ func (m *model) inputView() string {
 		}
 		lines = append(lines, m.input.View())
 	} else if m.sideMode {
-		lines = append(lines, styleHint.Render("/btw — введите вопрос (Enter — отправить, Esc — отмена)"))
+		lines = append(lines, styleHint.Render(i18n.T("tui.btw_input")))
 		lines = append(lines, m.input.View())
 	} else {
 		lines = append(lines, m.input.View())
-		lines = append(lines, styleHint.Render("Агент работает… начните вводить /btw <вопрос>, чтобы спросить мимоходом"))
+		lines = append(lines, styleHint.Render(i18n.T("tui.agent_busy")))
 	}
 	if e := m.input.Error(); e != "" {
 		lines = append(lines, styleErr.Render("  ✗ "+e))
@@ -730,7 +730,7 @@ func (m *model) scrolledLog(height int) string {
 	}
 	content := strings.Join(m.log[m.logScroll:end], "\n")
 	if content == "" {
-		return styleHint.Render("(пусто)")
+		return styleHint.Render(i18n.T("tui.empty"))
 	}
 	return content
 }
@@ -742,7 +742,7 @@ func (m *model) treeContent(width, height int) string {
 	lines := m.treeLines()
 	total := len(lines)
 	if total == 0 {
-		return styleTree.Render("(пусто)")
+		return styleTree.Render(i18n.T("tui.empty"))
 	}
 	if m.treeSel == nil {
 		m.treeSel = lines[0].node
