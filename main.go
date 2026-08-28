@@ -12,14 +12,23 @@ import (
 	"github.com/explorerTNT/TinyCode/internal/tui"
 )
 
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	var (
-		model      = flag.String("model", "", "override model name")
-		workspace  = flag.String("workspace", "", "workspace directory")
-		permission = flag.String("permission", "", "permission mode: auto|ask|deny")
-		resume     = flag.String("resume", "", "resume a session (last one if empty)")
+		model       = flag.String("model", "", "override model name")
+		workspace   = flag.String("workspace", "", "workspace directory")
+		permission  = flag.String("permission", "", "permission mode: auto|ask|deny")
+		resume      = flag.String("resume", "", "resume a session (last one if empty)")
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("tiny-code %s\n", version)
+		return
+	}
 
 	cfg, err := config.Load()
 	if err != nil {

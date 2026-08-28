@@ -447,9 +447,8 @@ func (a *Agent) showPlan(plan string) {
 	}
 	a.io.Println(strings.Repeat("=", 50))
 
-	if _, err := a.sessions.savePlan(plan); err == nil {
-		// persisted; ignore errors here
-	}
+	// Best-effort persistence; a failed plan save must not break the turn.
+	_, _ = a.sessions.savePlan(plan)
 }
 
 func (a *Agent) handlePlanApproval() {

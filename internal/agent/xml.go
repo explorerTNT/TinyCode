@@ -14,12 +14,6 @@ var (
 	reToolCallInner = regexp.MustCompile(`(?s)<tool_call>(.*?)</tool_call>`)
 )
 
-// isXMLToolCall reports whether content is a single XML tool call.
-func isXMLToolCall(content string) bool {
-	s := strings.TrimSpace(content)
-	return strings.HasPrefix(s, "<tool_call>") && strings.HasSuffix(s, "</tool_call>")
-}
-
 // stripXMLToolCalls removes XML tool-call markup from a text reply.
 func stripXMLToolCalls(text string) string {
 	text = reToolCallBlock.ReplaceAllString(text, "")
