@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/explorerTNT/TinyCode/internal/i18n"
 	"github.com/explorerTNT/TinyCode/internal/tools"
 )
 
@@ -105,7 +106,7 @@ func (s *Service) CheckBash(command string) bool {
 		}
 	}
 
-	return s.askUser("Run this command?\n  $ " + command + "\nApprove? (y/n/a always) ")
+	return s.askUser(i18n.T("perm.run", command))
 }
 
 // CheckWrite decides whether a file write may proceed.
@@ -116,7 +117,7 @@ func (s *Service) CheckWrite(path string) bool {
 	case ModeDeny:
 		return false
 	}
-	return s.askUser("Write to " + path + "? (y/n) ")
+	return s.askUser(i18n.T("perm.write", path))
 }
 
 // askUser prompts the user and interprets the reply. "a" switches the service

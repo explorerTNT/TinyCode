@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/explorerTNT/TinyCode/internal/config"
+	"github.com/explorerTNT/TinyCode/internal/i18n"
 	"github.com/explorerTNT/TinyCode/internal/llm"
 	"github.com/explorerTNT/TinyCode/internal/permissions"
 	"github.com/explorerTNT/TinyCode/internal/tools"
@@ -83,8 +84,8 @@ func New(cfg *config.Config, io IO) (*Agent, error) {
 
 	ask := func(question string) string {
 		io.Println("")
-		io.Println("--- AI asks: " + question + " ---")
-		ans, err := io.Input("> ")
+		io.Println(i18n.T("agent.asks", question))
+		ans, err := io.Input(i18n.T("agent.asks_prompt"))
 		if err != nil {
 			return "User cancelled the input"
 		}
@@ -175,7 +176,7 @@ func (a *Agent) ResumeSession(name string) bool {
 	a.planMode = data.PlanMode
 	a.ctx.reset()
 	a.ctx.pushAll(a.messages)
-	a.io.Println(fmt.Sprintf("  [resumed session: %s (%d messages)]\n", data.Name, len(a.messages)))
+	a.io.Println(i18n.T("session.resumed", data.Name, len(a.messages)))
 	return true
 }
 
@@ -289,7 +290,7 @@ func (a *Agent) enforceWorkspace(args map[string]any) string {
 		repaired := filepath.Join(a.workspace, basename)
 		if insideWorkspace(a.workspace, repaired) && fileExists(repaired) {
 			args["path"] = basename
-			a.io.Println(fmt.Sprintf("  [path corrected: %q -> %q]", raw, basename))
+			a.io.Println(i18n.T("agent.path_corrected", raw, basename))
 			return ""
 		}
 	}
@@ -305,7 +306,7 @@ func (a *Agent) enforceWorkspace(args map[string]any) string {
 			}
 			if len(exact) == 1 {
 				args["path"] = exact[0]
-				a.io.Println(fmt.Sprintf("  [path corrected: %q -> %q]", raw, exact[0]))
+				a.io.Println(i18n.T("agent.path_corrected", raw, exact[0]))
 				return ""
 			}
 		}
@@ -384,12 +385,12 @@ func (a *Agent) executeTool(name string, args map[string]any) string {
 		original := strArg(args, "command")
 		cleaned := tools.SanitizeCmd(original)
 		if cleaned != original {
-			a.io.Println(fmt.Sprintf("  [command normalized: %s]", cleaned))
+			a.io.Println(i18n.T("agent.command_normalized", cleaned))
 			args["command"] = cleaned
 		}
 		quoted := tools.QuoteExistingPaths(a.workspace, strArg(args, "command"))
 		if quoted != strArg(args, "command") {
-			a.io.Println(fmt.Sprintf("  [path quoted: %s]", quoted))
+			a.io.Println(i18n.T("agent.path_quoted", quoted))
 			args["command"] = quoted
 		}
 	}
@@ -411,7 +412,7 @@ func (a *Agent) executeTool(name string, args map[string]any) string {
 	}
 
 	if name == runBashTool {
-		a.io.Println("  [команда выполняется…]")
+		a.io.Println(i18n.T("agent.running_cmd"))
 	}
 
 	return a.runTool(fn, args)

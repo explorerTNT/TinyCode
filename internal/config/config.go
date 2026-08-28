@@ -25,6 +25,8 @@ type TNConfig struct {
 }
 
 type Config struct {
+	// Interface language: "en" or "ru".
+	Language string `json:"language" env:"TINYCODE_LANG"`
 	// Language Model Config
 	LM *LMConfig `json:"language_model"`
 	// Tiny Code Config

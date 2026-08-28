@@ -13,6 +13,8 @@ import (
 
 	"github.com/pmezard/go-difflib/difflib"
 	"golang.org/x/text/encoding/charmap"
+
+	"github.com/explorerTNT/TinyCode/internal/i18n"
 )
 
 var (
@@ -393,7 +395,7 @@ func EditFile(workspace, path string, oldString, newString string, rawStart, raw
 
 	if startLine > 0 {
 		if oldString != "" {
-			note("[edit_file: start_line and old_string both given for %s; using line numbers]", path)
+			note(i18n.T("edit.both_given", path))
 		}
 		if endLine == 0 {
 			endLine = startLine
