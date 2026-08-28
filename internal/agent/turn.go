@@ -171,7 +171,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 				}
 
 				if strings.HasPrefix(result, "Error:") {
-				a.io.Println(i18n.T("agent.tool_error", result))
+					a.io.Println(i18n.T("agent.tool_error", result))
 					recentErrors = append(recentErrors, fmt.Sprintf("%s: %s", name, truncateStr(result, 200)))
 					if len(recentErrors) > 8 {
 						recentErrors = recentErrors[1:]
@@ -226,7 +226,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 			cleanContent := stripXMLToolCalls(content)
 			if cleanContent != "" {
 				preview := strings.ReplaceAll(truncateStr(cleanContent, 300), "\n", " ")
-					a.io.Println(i18n.T("agent.round", rnd+1, maxRounds, preview))
+				a.io.Println(i18n.T("agent.round", rnd+1, maxRounds, preview))
 				msg.Content = cleanContent
 				a.updateStoredContent(content, cleanContent)
 

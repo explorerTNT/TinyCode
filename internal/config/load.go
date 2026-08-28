@@ -15,7 +15,7 @@ func Default() *Config {
 	workspace, _ := os.Getwd()
 	return &Config{
 		Language: "en",
-		LM:       &LMConfig{
+		LM: &LMConfig{
 			Host: "127.0.0.1",
 			Port: 1234,
 			Name: "qwen/qwen3.5-9b",

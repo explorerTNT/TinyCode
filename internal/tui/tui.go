@@ -197,7 +197,7 @@ func newModel(cfg *config.Config) *model {
 		cfg:      cfg,
 		input:    newInput(),
 		answerCh: make(chan string, 1),
-		status: i18n.T("tui.model_status", cfg.LM.Name, cfg.TN.Workspace, cfg.TN.PermissionMode),
+		status:   i18n.T("tui.model_status", cfg.LM.Name, cfg.TN.Workspace, cfg.TN.PermissionMode),
 	}
 	m.tree = buildTreeNodes(cfg.TN.Workspace)
 	m.fileIndex = buildFileIndex(m.tree, cfg.TN.Workspace)
