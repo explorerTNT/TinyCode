@@ -17,6 +17,12 @@ concurrency:
 env:
   GOTOOLCHAIN: auto
 
+# Windows runners default to PowerShell, which splits `-flag=value` arguments
+# and breaks `go test -coverprofile=...`. Use bash everywhere instead.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lint:
     name: Lint
@@ -30,7 +36,6 @@ jobs:
           cache: true
 
       - name: Check gofmt
-        shell: bash
         run: |
           unformatted="$(gofmt -l . )"
           if [ -n "$unformatted" ]; then
@@ -41,7 +46,6 @@ jobs:
           fi
 
       - name: Verify go.mod is tidy
-        shell: bash
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
@@ -128,22 +132,31 @@ jobs:
             ext: ""
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
+      - name: Resolve version
+        id: version
+        run: |
+          version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build binaries
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" \
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
             -o "dist/tiny-code-${GOOS}-${GOARCH}${{ matrix.ext }}" .
-          go build -trimpath -ldflags="-s -w" \
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
             -o "dist/tiny-code-benchmark-${GOOS}-${GOARCH}${{ matrix.ext }}" ./cmd/benchmark
 
       - uses: actions/upload-artifact@v4

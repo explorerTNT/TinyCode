@@ -186,14 +186,33 @@ go run ./cmd/benchmark -quick       # только 2 задачи
 | Workflow | Триггер | Что делает |
 |---|---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | push / PR | gofmt, `go vet`, staticcheck, `go mod tidy`, тесты на Windows/Linux/macOS, кросс-сборка на 6 платформ |
-| [`release.yml`](.github/workflows/release.yml) | тег `v*` | архивы под каждую платформу, `SHA256SUMS.txt`, публикация GitHub Release |
+| [`release.yml`](.github/workflows/release.yml) | push в `main`, тег `v*`, вручную | считает версию, собирает архивы, `SHA256SUMS.txt`, публикует GitHub Release |
 
-Выпуск новой версии:
+### Автоматические релизы
+
+Версия считается сама по сообщениям коммитов
+([Conventional Commits](https://www.conventionalcommits.org/)) с последнего тега:
+
+| Коммиты с последнего тега | Bump | Пример |
+|---|---|---|
+| `feat!:` или `BREAKING CHANGE` в теле | major | `v1.2.3` → `v2.0.0` |
+| `feat:` | minor | `v1.2.3` → `v1.3.0` |
+| `fix:` / `perf:` / `refactor:` | patch | `v1.2.3` → `v1.2.4` |
+| только `docs:` / `chore:` / `ci:` / `test:` | — | релиз не создаётся |
+
+То есть достаточно писать осмысленные коммиты — тег и релиз появятся сами при пуше в `main`.
+
+Если нужно выпустить версию руками, есть два пути:
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.0; git push origin v0.1.0   # явный тег — публикуется как есть
 ```
+
+либо запустить workflow **Release** через `workflow_dispatch`, выбрав bump
+(`auto` / `patch` / `minor` / `major`) — это переопределит автоопределение.
+
+Версия вшивается в бинарник через `-ldflags -X main.version` и доступна как `tiny-code -version`.
+Сборки из CI получают версию от `git describe`, поэтому у dev-бинарников она вида `v0.1.0-3-gabc1234`.
 
 ---
 
