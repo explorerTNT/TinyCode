@@ -99,7 +99,21 @@ go build -o tiny-code.exe .
 .\tiny-code.exe -workspace C:\project -permission auto "добавь тесты"
 .\tiny-code.exe -resume                                # продолжить последнюю сессию
 .\tiny-code.exe -resume -session my_session            # продолжить сессию по имени
+.\tiny-code.exe -update                                # проверить и установить обновление
 ```
+
+### Автообновление
+
+При запуске TinyCode проверяет GitHub на наличие новой версии.
+Если доступно обновление, в stderr появляется уведомление.
+Чтобы установить обновление:
+
+```powershell
+.\tiny-code.exe -update
+```
+
+Чтобы отключить проверку: `-no-update` или переменная окружения `TINYCODE_NO_UPDATE=1`.
+Dev-сборки (`version = "dev"`) не проверяются.
 
 ### Команды в сессии
 
@@ -129,6 +143,8 @@ go build -o tiny-code.exe .
 | `-resume` | Продолжить последнюю сессию |
 | `-session <имя>` | Имя сессии для `-resume` (по умолчанию последняя) |
 | `-lang en\|ru` | Язык интерфейса |
+| `-update` | Проверить и установить обновление |
+| `-no-update` | Пропустить проверку обновлений при запуске |
 | `-version` | Показать версию и выйти |
 
 ### Конфигурация

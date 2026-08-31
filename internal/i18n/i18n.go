@@ -154,6 +154,10 @@ var catalog = map[Lang]map[string]string{
 		"tui.empty":           "(empty)",
 		"tui.model_status":    "model: %s\nworkspace: %s\nperms: %s",
 		"edit.both_given":     "[edit_file: start_line and old_string both given for %s; using line numbers]",
+		"update.available":    "\n  Update available: %s (current: %s)\n  Run `tiny-code -update` to install.\n",
+		"update.downloading":  "  Downloading %s…",
+		"update.done":         "  Updated to %s. Restart tiny-code to use the new version.\n",
+		"update.failed":       "  Update failed: %v\n",
 	},
 	Ru: {
 		"main.config_error":         "ошибка конфигурации: %v",
@@ -269,6 +273,10 @@ var catalog = map[Lang]map[string]string{
 		"tui.empty":           "(пусто)",
 		"tui.model_status":    "модель: %s\nрабочая папка: %s\nправа: %s",
 		"edit.both_given":     "[edit_file: заданы и start_line, и old_string для %s; использую номера строк]",
+		"update.available":    "\n  Доступно обновление: %s (текущая: %s)\n  Запустите `tiny-code -update` для установки.\n",
+		"update.downloading":  "  Скачиваю %s…",
+		"update.done":         "  Обновлено до %s. Перезапустите tiny-code.\n",
+		"update.failed":       "  Ошибка обновления: %v\n",
 	},
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/explorerTNT/TinyCode/internal/config"
 	"github.com/explorerTNT/TinyCode/internal/i18n"
 	"github.com/explorerTNT/TinyCode/internal/tui"
+	"github.com/explorerTNT/TinyCode/internal/updater"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".
@@ -25,6 +26,8 @@ func main() {
 		session     = flag.String("session", "", "session name to resume (used with -resume)")
 		lang        = flag.String("lang", "", "interface language: en|ru")
 		showVersion = flag.Bool("version", false, "print version and exit")
+		doUpdate    = flag.Bool("update", false, "check for updates and install if available")
+		noUpdate    = flag.Bool("no-update", false, "skip update check on startup")
 	)
 	flag.Parse()
 
@@ -44,6 +47,12 @@ func main() {
 	}
 	i18n.Set(i18n.Parse(cfg.Language))
 
+	// --- update mode ---
+	if *doUpdate {
+		runUpdate()
+		return
+	}
+
 	if *model != "" {
 		cfg.LM.Name = *model
 	}
@@ -58,6 +67,11 @@ func main() {
 		if wd, err := os.Getwd(); err == nil {
 			cfg.TN.Workspace = wd
 		}
+	}
+
+	// --- background update check ---
+	if !*noUpdate && !updater.IsDev(version) {
+		go checkUpdate()
 	}
 
 	prompt := strings.Join(flag.Args(), " ")
@@ -90,4 +104,36 @@ func runOnce(cfg *config.Config, prompt string) {
 		os.Exit(1)
 	}
 	ag.RunOnce(prompt)
+}
+
+func checkUpdate() {
+	release, err := updater.CheckLatest()
+	if err != nil {
+		return
+	}
+	if updater.Compare(release.Tag, version) <= 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, i18n.T("update.available"), release.Tag, version)
+}
+
+func runUpdate() {
+	fmt.Fprintf(os.Stderr, i18n.T("update.downloading"), "latest")
+	release, err := updater.CheckLatest()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, i18n.T("update.failed"), err)
+		os.Exit(1)
+	}
+
+	if updater.Compare(release.Tag, version) <= 0 {
+		fmt.Fprintf(os.Stderr, "\n  Already on the latest version (%s).\n", version)
+		return
+	}
+
+	if err := updater.Install(release); err != nil {
+		fmt.Fprintf(os.Stderr, i18n.T("update.failed"), err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, i18n.T("update.done"), release.Tag)
 }
