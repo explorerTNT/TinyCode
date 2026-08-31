@@ -21,7 +21,8 @@ func main() {
 		model       = flag.String("model", "", "override model name")
 		workspace   = flag.String("workspace", "", "workspace directory")
 		permission  = flag.String("permission", "", "permission mode: auto|ask|deny")
-		resume      = flag.String("resume", "", "resume a session (last one if empty)")
+		resume      = flag.Bool("resume", false, "resume the last session")
+		session     = flag.String("session", "", "session name to resume (used with -resume)")
 		lang        = flag.String("lang", "", "interface language: en|ru")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
@@ -53,6 +54,12 @@ func main() {
 		cfg.TN.PermissionMode = *permission
 	}
 
+	if cfg.TN.Workspace == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cfg.TN.Workspace = wd
+		}
+	}
+
 	prompt := strings.Join(flag.Args(), " ")
 
 	if prompt != "" {
@@ -61,9 +68,9 @@ func main() {
 	}
 
 	var onReady func(*agent.Agent)
-	if resumeFlagSet() {
+	if *resume {
 		onReady = func(a *agent.Agent) {
-			if !a.ResumeSession(*resume) {
+			if !a.ResumeSession(*session) {
 				a.IO().Println(i18n.T("main.no_session"))
 			}
 		}
@@ -73,16 +80,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n", i18n.T("main.tui_error", err))
 		os.Exit(1)
 	}
-}
-
-func resumeFlagSet() bool {
-	set := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "resume" {
-			set = true
-		}
-	})
-	return set
 }
 
 func runOnce(cfg *config.Config, prompt string) {

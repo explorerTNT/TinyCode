@@ -623,10 +623,19 @@ func (m *model) treePanelGeometry() (topY, innerHeight int, ok bool) {
 		return 0, 0, false
 	}
 	topY = 1 + statusH + 2 // header + status box + tree top border + title
-	innerHeight = treeH - 3
-	if innerHeight < 1 {
-		innerHeight = 1
+	visibleLines := len(m.treeLines())
+	innerCap := treeH - 3
+	if innerCap < 1 {
+		innerCap = 1
 	}
+	inner := visibleLines
+	if inner > innerCap {
+		inner = innerCap
+	}
+	if inner < 1 {
+		inner = 1
+	}
+	innerHeight = inner
 	return topY, innerHeight, true
 }
 
@@ -665,11 +674,24 @@ func (m *model) View() string {
 	status := styleSideBrd.Width(rightW).Height(statusH - 2).Render(i18n.T("tui.status_label") + "\n" + styleStatus.Render(m.status))
 	side := status
 	if treeH >= 2 {
+		visibleLines := len(m.treeLines())
+		innerCap := treeH - 3 // borders(2) + title(1)
+		if innerCap < 1 {
+			innerCap = 1
+		}
+		inner := visibleLines
+		if inner > innerCap {
+			inner = innerCap
+		}
+		if inner < 1 {
+			inner = 1
+		}
 		title := i18n.T("tui.files")
 		if m.treeFocus {
 			title = i18n.T("tui.files_active")
 		}
-		tree := styleSideBrd.Width(rightW).Height(treeH - 2).Render(title + "\n" + m.treeContent(rightW-2, treeH-3))
+		treeHRendered := inner + 1 + 2 // content + title + borders
+		tree := styleSideBrd.Width(rightW).Height(treeHRendered).Render(title + "\n" + m.treeContent(rightW-2, inner))
 		side = lipgloss.JoinVertical(lipgloss.Left, status, tree)
 	}
 

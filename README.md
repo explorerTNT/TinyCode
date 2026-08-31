@@ -87,6 +87,7 @@ go build -o tiny-code.exe .
 там собраны сборки для Windows, Linux и macOS (amd64 / arm64).
 
 При первом запуске создаётся `~/.tinycode/config.json` со значениями по умолчанию.
+Рабочая директория не сохраняется в конфиге — по умолчанию используется текущая.
 
 ---
 
@@ -96,6 +97,8 @@ go build -o tiny-code.exe .
 .\tiny-code.exe                                       # интерактивный режим (TUI)
 .\tiny-code.exe "объясни, что делает main.go"          # одиночный запрос
 .\tiny-code.exe -workspace C:\project -permission auto "добавь тесты"
+.\tiny-code.exe -resume                                # продолжить последнюю сессию
+.\tiny-code.exe -resume -session my_session            # продолжить сессию по имени
 ```
 
 ### Команды в сессии
@@ -123,7 +126,9 @@ go build -o tiny-code.exe .
 | `-workspace <путь>` | Рабочая директория (по умолчанию текущая) |
 | `-permission auto\|ask\|deny` | Режим прав (по умолчанию `ask`) |
 | `-model <имя>` | Переопределить имя модели |
-| `-resume [имя]` | Продолжить последнюю или названную сессию |
+| `-resume` | Продолжить последнюю сессию |
+| `-session <имя>` | Имя сессии для `-resume` (по умолчанию последняя) |
+| `-lang en\|ru` | Язык интерфейса |
 | `-version` | Показать версию и выйти |
 
 ### Конфигурация

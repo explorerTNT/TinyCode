@@ -11,8 +11,9 @@ import (
 )
 
 // Default returns the configuration with default values.
+// Workspace is intentionally left empty — it defaults to the current working
+// directory at runtime and is never persisted to the config file.
 func Default() *Config {
-	workspace, _ := os.Getwd()
 	return &Config{
 		Language: "en",
 		LM: &LMConfig{
@@ -30,7 +31,6 @@ func Default() *Config {
 			Temperature:       0.6,
 			ActionTemperature: 0.1,
 			PermissionMode:    "ask",
-			Workspace:         workspace,
 		},
 	}
 }
@@ -148,7 +148,9 @@ func setField(field reflect.Value, raw string) error {
 	return nil
 }
 
-// Save writes the configuration to the config file, creating directories as needed.
+// Save writes the configuration to the config file, creating directories as
+// needed. Workspace is never persisted — it is always resolved at runtime from
+// the current directory, CLI flags, or environment variables.
 func (c *Config) Save() error {
 	path, err := ConfigPath()
 	if err != nil {
@@ -159,7 +161,14 @@ func (c *Config) Save() error {
 		return fmt.Errorf("create config dir: %w", err)
 	}
 
-	data, err := json.MarshalIndent(c, "", "  ")
+	saved := *c
+	if c.TN != nil {
+		tnCopy := *c.TN
+		tnCopy.Workspace = ""
+		saved.TN = &tnCopy
+	}
+
+	data, err := json.MarshalIndent(&saved, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
