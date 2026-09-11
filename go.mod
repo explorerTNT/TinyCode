@@ -8,7 +8,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/sashabaranov/go-openai v1.42.0
-	golang.org/x/mod v0.40.0
+	golang.org/x/mod v0.41.0
 	golang.org/x/net v0.58.0
 	golang.org/x/text v0.41.0
 )
