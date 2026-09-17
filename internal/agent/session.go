@@ -81,11 +81,7 @@ func (s *SessionManager) load(name string) (*sessionData, error) {
 	path := s.safePath(name)
 	b, err := os.ReadFile(path)
 	if err != nil {
-		alt := filepath.Join(s.sessionDir, name+".json")
-		b, err = os.ReadFile(alt)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 	var data sessionData
 	if err := json.Unmarshal(b, &data); err != nil {

@@ -106,7 +106,7 @@ func (i *input) acceptCompletion() {
 		return
 	}
 	cur := i.Value()
-	if len(i.completion) > len(cur) {
+	if i.cursor == len(cur) && len(i.completion) > len(cur) {
 		i.insert([]rune(i.completion[len(cur):]))
 	}
 	i.completion = ""
@@ -114,11 +114,18 @@ func (i *input) acceptCompletion() {
 
 func (i *input) View() string {
 	v := i.value
-	before := string(v[:i.cursor])
+	cursor := i.cursor
+	if cursor > len(v) {
+		cursor = len(v)
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	before := string(v[:cursor])
 	var cur, after string
-	if i.cursor < len(v) {
-		cur = string(v[i.cursor])
-		after = string(v[i.cursor+1:])
+	if cursor < len(v) {
+		cur = string(v[cursor])
+		after = string(v[cursor+1:])
 	} else {
 		cur = " "
 		after = ""
@@ -133,7 +140,7 @@ func (i *input) View() string {
 	}
 	b.WriteString(styleInputText.Render(after))
 
-	if i.completion != "" && i.cursor == len(v) {
+	if i.completion != "" && cursor == len(v) {
 		if len(i.completion) > len(string(v)) {
 			suffix := i.completion[len(string(v)):]
 			b.WriteString(styleHint.Render(suffix))

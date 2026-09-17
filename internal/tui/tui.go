@@ -51,7 +51,7 @@ var (
 func highlightCode(code, lang string) []string {
 	plain := strings.Split(code, "\n")
 	if lang == "" || lang == "text" {
-		lang = "python"
+		return plain
 	}
 	if strings.Count(code, "\n") > 2000 {
 		return plain
@@ -389,6 +389,12 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	case "pgdown":
 		m.logScroll += m.logHeight()
+		if max := len(m.log) - m.logHeight(); m.logScroll > max {
+			m.logScroll = max
+		}
+		if m.logScroll < 0 {
+			m.logScroll = 0
+		}
 		return nil
 	}
 
@@ -590,8 +596,8 @@ func (m *model) inputBlockHeight() int {
 
 func (m *model) bodyH() int {
 	h := m.height - 1 - 1 - m.inputBlockHeight() // header + footer + input block
-	if h < 4 {
-		h = 4
+	if h < 1 {
+		h = 1
 	}
 	return h
 }
@@ -964,7 +970,25 @@ func (m *model) moveTreeSel(delta int) {
 
 func (m *model) toggleTreeSel() {
 	if m.treeSel != nil && m.treeSel.isDir {
-		m.treeSel.expanded = !m.treeSel.expanded
+		if m.treeSel.expanded {
+			m.treeSel.expanded = false
+			return
+		}
+		m.treeSel.expanded = true
+	}
+}
+
+// selectParentIfDescendant moves treeSel to the folder being collapsed when
+// the current selection is inside it, preventing a jump to the top.
+func (m *model) selectParentIfDescendant(folder *treeNode) {
+	if m.treeSel == nil || m.treeSel == folder {
+		return
+	}
+	for n := m.treeSel; n != nil; n = n.parent {
+		if n == folder {
+			m.treeSel = folder
+			return
+		}
 	}
 }
 
@@ -1032,6 +1056,9 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	m.lastClickAt = time.Now()
 	m.treeSel = node
 	if node.isDir {
+		if node.expanded {
+			m.selectParentIfDescendant(node)
+		}
 		node.expanded = !node.expanded
 	}
 	return nil

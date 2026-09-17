@@ -377,10 +377,10 @@ func (a *Agent) processPlanTurn() {
 			return
 		}
 
+		if len(tcList) > maxCallsPerRound {
+			tcList = tcList[:maxCallsPerRound]
+		}
 		for _, tc := range tcList {
-			if len(tcList) > maxCallsPerRound {
-				tcList = tcList[:maxCallsPerRound]
-			}
 			name := tc.Name
 			args := argsMap(safeJSONLoads(tc.Arguments))
 
@@ -589,10 +589,12 @@ func (a *Agent) handleSessionCommand(cmd string) bool {
 				a.io.Println(i18n.T("session.not_found", name))
 				return true
 			}
+			a.msgMu.Lock()
 			a.messages = data.Messages
 			a.planMode = data.PlanMode
 			a.ctx.reset()
 			a.ctx.pushAll(a.messages)
+			a.msgMu.Unlock()
 			a.io.Println(i18n.T("session.resumed", data.Name, len(a.messages)))
 			return true
 
@@ -686,7 +688,7 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 
 	case strings.HasPrefix(c, "!"):
 		cmdText := strings.TrimSpace(c[1:])
-		result := a.toolMap[runBashTool].Run(map[string]any{"command": cmdText, "timeout": float64(30)})
+		result := a.executeTool(runBashTool, map[string]any{"command": cmdText, "timeout": float64(30)})
 		a.io.Println(result)
 		return true, false
 	}

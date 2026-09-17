@@ -172,10 +172,12 @@ func (a *Agent) ResumeSession(name string) bool {
 	if err != nil {
 		return false
 	}
+	a.msgMu.Lock()
 	a.messages = data.Messages
 	a.planMode = data.PlanMode
 	a.ctx.reset()
 	a.ctx.pushAll(a.messages)
+	a.msgMu.Unlock()
 	a.io.Println(i18n.T("session.resumed", data.Name, len(a.messages)))
 	return true
 }

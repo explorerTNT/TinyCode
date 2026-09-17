@@ -37,10 +37,8 @@ func newContextManager(maxTokens int) *ContextManager {
 	return &ContextManager{maxTokens: maxTokens, reserve: 4096}
 }
 
-func (c *ContextManager) push(m Message) bool {
-	tokens := countMessageTokens(m)
-	c.estimated += tokens
-	return c.estimated < c.maxTokens-c.reserve
+func (c *ContextManager) push(m Message) {
+	c.estimated += countMessageTokens(m)
 }
 
 func (c *ContextManager) reset() {

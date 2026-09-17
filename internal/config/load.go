@@ -101,7 +101,19 @@ func applyEnvValue(v reflect.Value) error {
 		}
 		if field.Kind() == reflect.Pointer && field.Type().Elem().Kind() == reflect.Struct {
 			if field.IsNil() {
-				field.Set(reflect.New(field.Type().Elem()))
+				newPtr := reflect.New(field.Type().Elem())
+				def := Default()
+				switch field.Type().Elem().Name() {
+				case "LMConfig":
+					if def.LM != nil {
+						newPtr.Elem().Set(reflect.ValueOf(*def.LM))
+					}
+				case "TNConfig":
+					if def.TN != nil {
+						newPtr.Elem().Set(reflect.ValueOf(*def.TN))
+					}
+				}
+				field.Set(newPtr)
 			}
 			if err := applyEnvValue(field); err != nil {
 				return err

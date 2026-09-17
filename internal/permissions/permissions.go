@@ -55,7 +55,6 @@ type InputFunc func(prompt string) (string, error)
 // mode through the injected InputFunc.
 type Service struct {
 	mode                        Mode
-	approvedBashPatterns        []string
 	autoApproveReadOnlyCommands bool
 	input                       InputFunc
 }
@@ -98,12 +97,6 @@ func (s *Service) CheckBash(command string) bool {
 
 	if s.autoApproveReadOnlyCommands && isCommandReadOnly(stripped) {
 		return true
-	}
-
-	for _, pattern := range s.approvedBashPatterns {
-		if strings.HasPrefix(stripped, pattern) {
-			return true
-		}
 	}
 
 	return s.askUser(i18n.T("perm.run", command))
