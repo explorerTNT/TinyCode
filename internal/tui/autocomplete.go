@@ -234,7 +234,7 @@ func (a *autocomplete) View(width int) string {
 			line += "  " + styleHint.Render(o.Description)
 		}
 		if i == a.selected {
-			line = styleTreeSel.Width(width - 2).Render(line)
+			line = styleTreeSel.Width(width).Render(line)
 		} else {
 			line = styleTree.Render(line)
 		}
@@ -243,5 +243,5 @@ func (a *autocomplete) View(width int) string {
 		}
 		b.WriteString(line)
 	}
-	return styleSideBrd.Width(width).Render(b.String())
+	return b.String()
 }

@@ -580,7 +580,7 @@ func (m *model) inputBlockHeight() int {
 	lines := 1 // input line
 	if m.inputActive {
 		if n := len(m.ac.options); n > 0 {
-			lines += n + 2 // autocomplete menu block with border
+			lines += n // autocomplete menu items (no border)
 		}
 		if m.prompt != "" {
 			lines += strings.Count(m.prompt, "\n") + 1
@@ -677,7 +677,7 @@ func (m *model) View() string {
 		treeH = 0
 	}
 
-	status := styleSideBrd.Width(rightW).Height(statusH - 2).Render(i18n.T("tui.status_label") + "\n" + styleStatus.Render(m.status))
+	status := styleSideBrd.Width(rightW).Height(statusH).Render(i18n.T("tui.status_label") + "\n" + styleStatus.Render(m.status))
 	side := status
 	if treeH >= 2 {
 		visibleLines := len(m.treeLines())
@@ -716,7 +716,7 @@ func (m *model) View() string {
 func (m *model) inputView() string {
 	var lines []string
 	if m.inputActive {
-		if ac := m.ac.View(m.width - 4); ac != "" {
+		if ac := m.ac.View(m.width - 2); ac != "" {
 			lines = append(lines, ac)
 		}
 		if m.prompt != "" {
@@ -818,7 +818,7 @@ func (m *model) treeContent(width, height int) string {
 
 // treeHeight returns the inner height of the tree panel.
 func (m *model) treeHeight() int {
-	h := m.bodyH() - 6 - 3 // status block + border/title lines
+	h := m.bodyH() - 6 - 3 // status block(6) + border(2) + title(1)
 	if h < 1 {
 		h = 1
 	}
