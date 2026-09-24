@@ -625,8 +625,8 @@ func (m *model) treePanelGeometry() (topY, innerHeight int, ok bool) {
 		statusH = bodyH
 		treeH = 0
 	}
-	if treeH < 2 {
-		return 0, 0, false
+	if treeH < 4 {
+		return 0, 0, false // box needs borders(2)+title(1)+content(1)
 	}
 	topY = 1 + statusH + 2 // header + status box + tree top border + title
 	visibleLines := len(m.treeLines())
@@ -668,7 +668,14 @@ func (m *model) View() string {
 		header += styleHint.Render(i18n.T("tui.model_info", m.agent.ModelName(), m.agent.PermissionMode()))
 	}
 
-	log := styleLogBrd.Width(leftW).Height(bodyH).Render(m.scrolledLog(bodyH - 2))
+	// lipgloss Height/Width apply to content only — the border adds 2 rows and
+	// 2 cols on top — so size the content total-2 and cap the final block at
+	// the total (issue #4: boxes grew past the terminal and slid the layout).
+	log := styleLogBrd.
+		Width(leftW - 2).
+		Height(bodyH - 2).
+		MaxHeight(bodyH).
+		Render(m.scrolledLog(bodyH - 2))
 
 	statusH := 6
 	treeH := bodyH - statusH
@@ -676,28 +683,35 @@ func (m *model) View() string {
 		statusH = bodyH
 		treeH = 0
 	}
+	// The tree box needs borders(2)+title(1)+content(1)=4 rows; below that
+	// the status box takes the whole body.
+	renderTree := treeH >= 4
 
-	status := styleSideBrd.Width(rightW).Height(statusH).Render(i18n.T("tui.status_label") + "\n" + styleStatus.Render(m.status))
+	statusTotal := statusH
+	if !renderTree {
+		statusTotal = bodyH
+	}
+	status := styleSideBrd.
+		Width(rightW - 2).
+		Height(statusTotal - 2).
+		MaxHeight(statusTotal).
+		Render(m.statusContent(rightW - 2))
+
 	side := status
-	if treeH >= 2 {
-		visibleLines := len(m.treeLines())
+	if renderTree {
 		innerCap := treeH - 3 // borders(2) + title(1)
 		if innerCap < 1 {
 			innerCap = 1
-		}
-		inner := visibleLines
-		if inner > innerCap {
-			inner = innerCap
-		}
-		if inner < 1 {
-			inner = 1
 		}
 		title := i18n.T("tui.files")
 		if m.treeFocus {
 			title = i18n.T("tui.files_active")
 		}
-		treeHRendered := inner + 1 + 2 // content + title + borders
-		tree := styleSideBrd.Width(rightW).Height(treeHRendered).Render(title + "\n" + m.treeContent(rightW-2, inner))
+		tree := styleSideBrd.
+			Width(rightW - 2).
+			Height(treeH - 2).
+			MaxHeight(treeH).
+			Render(title + "\n" + m.treeContent(rightW-2, innerCap))
 		side = lipgloss.JoinVertical(lipgloss.Left, status, tree)
 	}
 
@@ -736,6 +750,41 @@ func (m *model) inputView() string {
 	return styleInpBrd.Width(m.width - 2).Render(strings.Join(lines, "\n"))
 }
 
+// statusContent renders the status box content, truncating each line to
+// width so a long workspace path cannot wrap and grow the box.
+func (m *model) statusContent(width int) string {
+	lines := []string{truncatePlain(i18n.T("tui.status_label"), width)}
+	for _, ln := range strings.Split(m.status, "\n") {
+		lines = append(lines, styleStatus.Render(truncatePlain(ln, width)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// truncatePlain shortens s to at most w terminal cells, appending an
+// ellipsis when cut. s must be plain text (no ANSI sequences).
+func truncatePlain(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if n+rw > w-1 {
+			break
+		}
+		b.WriteRune(r)
+		n += rw
+	}
+	return b.String() + "…"
+}
+
 // scrolledLog returns up to height visible log lines, clamping the scroll offset.
 func (m *model) scrolledLog(height int) string {
 	total := len(m.log)
@@ -770,7 +819,7 @@ func (m *model) treeContent(width, height int) string {
 	lines := m.treeLines()
 	total := len(lines)
 	if total == 0 {
-		return styleTree.Render(i18n.T("tui.empty"))
+		return styleTree.Render(truncatePlain(i18n.T("tui.empty"), width))
 	}
 	if m.treeSel == nil {
 		m.treeSel = lines[0].node
@@ -802,7 +851,7 @@ func (m *model) treeContent(width, height int) string {
 
 	var b strings.Builder
 	for i := m.treeScroll; i < end; i++ {
-		text := renderTreeLine(lines[i])
+		text := truncatePlain(renderTreeLine(lines[i]), width)
 		if i == selIdx {
 			text = styleTreeSel.Width(width).Render(text)
 		} else {
