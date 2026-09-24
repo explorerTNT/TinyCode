@@ -525,7 +525,7 @@ func (a *Agent) compactMessages() {
 // SlashCommands lists the built-in slash commands (for the TUI autocomplete
 // hint and validation).
 var SlashCommands = []string{
-	"/help", "/session", "/sessions", "/clear", "/new", "/plan", "/compact", "/btw", "/exit",
+	"/help", "/session", "/sessions", "/clear", "/new", "/plan", "/compact", "/btw", "/exit", "/update",
 }
 
 // handleSessionCommand returns true if the input was a session command.

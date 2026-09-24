@@ -69,17 +69,20 @@ func main() {
 		}
 	}
 
-	// --- background update check ---
-	if !*noUpdate && !updater.IsDev(version) {
-		go checkUpdate()
-	}
-
+	// --- background update check (console mode only; the TUI shows it in-app) ---
+	updateEnabled := !*noUpdate && !updater.IsDev(version)
 	prompt := strings.Join(flag.Args(), " ")
 
 	if prompt != "" {
+		if updateEnabled {
+			go checkUpdate()
+		}
 		runOnce(cfg, prompt)
 		return
 	}
+
+	cfg.Version = version
+	cfg.UpdateCheck = updateEnabled
 
 	var onReady func(*agent.Agent)
 	if *resume {
@@ -114,26 +117,26 @@ func checkUpdate() {
 	if updater.Compare(release.Tag, version) <= 0 {
 		return
 	}
-	fmt.Fprintf(os.Stderr, i18n.T("update.available"), release.Tag, version)
+	fmt.Fprintf(os.Stderr, i18n.T("update.available")+"\n", release.Tag, version)
 }
 
 func runUpdate() {
-	fmt.Fprintf(os.Stderr, i18n.T("update.downloading"), "latest")
+	fmt.Fprintf(os.Stderr, i18n.T("update.downloading")+"\n", "latest")
 	release, err := updater.CheckLatest()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, i18n.T("update.failed"), err)
+		fmt.Fprintf(os.Stderr, i18n.T("update.failed")+"\n", err)
 		os.Exit(1)
 	}
 
 	if updater.Compare(release.Tag, version) <= 0 {
-		fmt.Fprintf(os.Stderr, "\n  Already on the latest version (%s).\n", version)
+		fmt.Fprintf(os.Stderr, i18n.T("update.latest")+"\n", version)
 		return
 	}
 
 	if err := updater.Install(release); err != nil {
-		fmt.Fprintf(os.Stderr, i18n.T("update.failed"), err)
+		fmt.Fprintf(os.Stderr, i18n.T("update.failed")+"\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, i18n.T("update.done"), release.Tag)
+	fmt.Fprintf(os.Stderr, i18n.T("update.done")+"\n", release.Tag)
 }

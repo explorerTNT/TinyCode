@@ -185,6 +185,8 @@ type model struct {
 	prompt      string
 	ac          *autocomplete
 
+	updateRunning bool
+
 	lastClickNode *treeNode
 	lastClickAt   time.Time
 
@@ -223,6 +225,9 @@ func Run(cfg *config.Config, onAgentReady func(*agent.Agent)) error {
 	m.agent = ag
 	if onAgentReady != nil {
 		onAgentReady(ag)
+	}
+	if cfg.UpdateCheck {
+		startUpdateCheck(p, cfg)
 	}
 
 	go func() {
@@ -263,6 +268,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentDoneMsg:
 		return m, tea.Quit
+
+	case updateFinishedMsg:
+		m.updateRunning = false
+		switch {
+		case msg.err != nil:
+			m.appendLog(i18n.T("update.failed", msg.err))
+		case msg.installed:
+			m.appendLog(i18n.T("update.done", msg.tag))
+		default:
+			m.appendLog(i18n.T("update.latest", msg.tag))
+		}
+		return m, nil
 
 	case tea.MouseMsg:
 		return m, m.handleMouse(msg)
@@ -480,10 +497,13 @@ func (m *model) submitInput() tea.Cmd {
 	m.input.Blur()
 	m.inputActive = false
 	m.ac.hide()
+	m.prompt = ""
+	if isUpdateCommand(value) {
+		return m.beginUpdate(raw)
+	}
 	if value != "" {
 		m.appendLog(">>> " + raw)
 	}
-	m.prompt = ""
 	m.answerCh <- value
 	return nil
 }
@@ -517,6 +537,9 @@ func (m *model) submitSide() tea.Cmd {
 
 	if raw == "" {
 		return nil
+	}
+	if isUpdateCommand(raw) {
+		return m.beginUpdate(raw)
 	}
 	q, ok := parseBtw(raw)
 	if !ok {

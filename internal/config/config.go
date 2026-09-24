@@ -31,4 +31,8 @@ type Config struct {
 	LM *LMConfig `json:"language_model"`
 	// Tiny Code Config
 	TN *TNConfig `json:"tiny_code"`
+	// Version is the running build version, injected by main (not persisted).
+	Version string `json:"-"`
+	// UpdateCheck enables the startup update notice in the TUI (injected by main).
+	UpdateCheck bool `json:"-"`
 }

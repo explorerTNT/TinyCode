@@ -113,6 +113,7 @@ var catalog = map[Lang]map[string]string{
   /compact              Summarize and shrink context
   /btw <question>       Ask a side question without interrupting the agent
   /exit                 End session
+  /update               Install the latest release from GitHub
 
   ! <command>           Run a shell command directly
 
@@ -154,10 +155,12 @@ var catalog = map[Lang]map[string]string{
 		"tui.empty":           "(empty)",
 		"tui.model_status":    "model: %s\nworkspace: %s\nperms: %s",
 		"edit.both_given":     "[edit_file: start_line and old_string both given for %s; using line numbers]",
-		"update.available":    "\n  Update available: %s (current: %s)\n  Run `tiny-code -update` to install.\n",
-		"update.downloading":  "  Downloading %s…",
-		"update.done":         "  Updated to %s. Restart tiny-code to use the new version.\n",
-		"update.failed":       "  Update failed: %v\n",
+		"update.available":    "Update available: %s (current: %s) — type /update to install",
+		"update.checking":     "Checking for updates…",
+		"update.downloading":  "Downloading %s…",
+		"update.latest":       "Already on the latest version (%s).",
+		"update.done":         "Updated to %s. Restart tiny-code to use the new version.",
+		"update.failed":       "Update failed: %v",
 	},
 	Ru: {
 		"main.config_error":         "ошибка конфигурации: %v",
@@ -232,6 +235,7 @@ var catalog = map[Lang]map[string]string{
   /compact              Сжать и сократить контекст
   /btw <вопрос>         Задать побочный вопрос, не прерывая агента
   /exit                 Завершить сессию
+  /update               Установить последний релиз с GitHub
 
   ! <команда>           Выполнить команду оболочки напрямую
 
@@ -273,10 +277,12 @@ var catalog = map[Lang]map[string]string{
 		"tui.empty":           "(пусто)",
 		"tui.model_status":    "модель: %s\nрабочая папка: %s\nправа: %s",
 		"edit.both_given":     "[edit_file: заданы и start_line, и old_string для %s; использую номера строк]",
-		"update.available":    "\n  Доступно обновление: %s (текущая: %s)\n  Запустите `tiny-code -update` для установки.\n",
-		"update.downloading":  "  Скачиваю %s…",
-		"update.done":         "  Обновлено до %s. Перезапустите tiny-code.\n",
-		"update.failed":       "  Ошибка обновления: %v\n",
+		"update.available":    "Доступно обновление: %s (текущая: %s) — введите /update для установки",
+		"update.checking":     "Проверяю обновления…",
+		"update.downloading":  "Скачиваю %s…",
+		"update.latest":       "Уже установлена последняя версия (%s).",
+		"update.done":         "Обновлено до %s. Перезапустите tiny-code.",
+		"update.failed":       "Ошибка обновления: %v",
 	},
 }
 
