@@ -14,23 +14,83 @@ import (
 	"github.com/explorerTNT/TinyCode/internal/config"
 )
 
-// task is one benchmark job. verify checks the result afterwards: a run only
-// counts as passed when the model's work is really there.
+// task is one benchmark job. setup prepares the workspace, verify checks
+// the result afterwards: a run only counts as passed when the model's work
+// is really there.
 type task struct {
 	Name   string
 	Prompt string
+	setup  func(workspace string) error
 	verify func(workspace string, turn agent.TurnResult) error
 }
 
 var tasks = []task{
-	{"hello world", "Write a Python hello world script that prints 'Hello from tiny-code!' and saves it to hello.py",
-		fileContains("hello.py", "Hello from tiny-code!")},
-	{"fibonacci", "Write a Python function that returns the nth Fibonacci number using dynamic programming. Save it to fib.py",
-		fileContains("fib.py", "def ")},
-	{"file read", "Read the file hello.py and tell me what it contains",
-		toolSucceeded("read_file")},
-	{"search", "Search for all .py files in the current directory and list their names",
-		toolSucceeded("list_files")},
+	{Name: "hello world",
+		Prompt: "Write a Python hello world script that prints 'Hello from tiny-code!' and saves it to hello.py",
+		verify: fileContains("hello.py", "Hello from tiny-code!")},
+	{Name: "fibonacci",
+		Prompt: "Write a Python function that returns the nth Fibonacci number using dynamic programming. Save it to fib.py",
+		verify: fileContains("fib.py", "def ")},
+	{Name: "file read",
+		Prompt: "Read the file hello.py and tell me what it contains",
+		verify: toolSucceeded("read_file")},
+	{Name: "search",
+		Prompt: "Search for all .py files in the current directory and list their names",
+		verify: toolSucceeded("list_files")},
+	// The tasks below exercise the crutches a small model runs on: a
+	// check after the edit, the project map and the instruction file.
+	{Name: "fix bug",
+		Prompt: "calc.py has a bug: the test in test_calc.py fails. Fix calc.py so that the test passes, then run the test to confirm.",
+		setup:  writeFixtures("calc.py", "def add(a, b):\n    return a - b\n", "test_calc.py", "from calc import add\n\nassert add(2, 3) == 5\nprint('ok')\n"),
+		verify: allOf(fileContains("calc.py", "return a + b"), toolSucceeded("run_bash"))},
+	{Name: "two files",
+		Prompt: "Create main.py that imports greet from greet.py and prints greet('world') when run.",
+		setup:  writeFixtures("greet.py", "def greet(name):\n    return 'hello ' + name\n"),
+		verify: fileContains("main.py", "import")},
+	{Name: "instructions",
+		Prompt: "Write a script hello.py that prints hi.",
+		setup:  writeFixtures("AGENTS.md", "# Project rules\n\nEvery new Python file starts with the line `# tinycode-demo`.\n"),
+		verify: fileStartsWith("hello.py", "# tinycode-demo")},
+}
+
+func writeFixtures(files ...string) func(string) error {
+	return func(workspace string) error {
+		for i := 0; i+1 < len(files); i += 2 {
+			path := filepath.Join(workspace, filepath.FromSlash(files[i]))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(path, []byte(files[i+1]), 0o644); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func fileStartsWith(rel, prefix string) func(string, agent.TurnResult) error {
+	return func(workspace string, _ agent.TurnResult) error {
+		data, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(rel)))
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(strings.TrimPrefix(string(data), "\uFEFF"), prefix) {
+			return fmt.Errorf("%s does not start with %q", rel, prefix)
+		}
+		return nil
+	}
+}
+
+// allOf passes only when every check passes and names the first failure.
+func allOf(checks ...func(string, agent.TurnResult) error) func(string, agent.TurnResult) error {
+	return func(workspace string, turn agent.TurnResult) error {
+		for _, check := range checks {
+			if err := check(workspace, turn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 func fileContains(rel, want string) func(string, agent.TurnResult) error {
@@ -132,6 +192,12 @@ func runBenchmark(cfg *config.Config, tasks []task) ([]result, float64) {
 	for _, t := range tasks {
 		fmt.Printf("\n%s\nBenchmark: %s\n%s\n", strings.Repeat("=", 60), t.Name, strings.Repeat("=", 60))
 
+		if t.setup != nil {
+			if err := t.setup(cfg.TN.Workspace); err != nil {
+				results = append(results, result{Task: t.Name, Status: "error", Outcome: "error", Error: err.Error()})
+				continue
+			}
+		}
 		ag, err := agent.New(cfg, agent.NewConsoleIO())
 		if err != nil {
 			results = append(results, result{Task: t.Name, Status: "error", Outcome: "error", Error: err.Error()})

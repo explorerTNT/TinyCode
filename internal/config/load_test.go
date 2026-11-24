@@ -77,6 +77,29 @@ func TestLoadFillsMissingFields(t *testing.T) {
 	if cfg.TN.Workspace != "" {
 		t.Fatalf("workspace must not be read from the file, got %q", cfg.TN.Workspace)
 	}
+	if cfg.TN.RepoMapChars != 4000 || cfg.TN.DisableSyntaxCheck {
+		t.Fatalf("new fields not defaulted: %+v", cfg.TN)
+	}
+}
+
+func TestLoadBooleanEnv(t *testing.T) {
+	isolateConfig(t)
+	for raw, want := range map[string]bool{"true": true, "1": true, "false": false, "0": false} {
+		t.Setenv("TINYCODE_DISABLE_SYNTAX_CHECK", raw)
+		cfg, err := Load()
+		if err != nil || cfg.TN.DisableSyntaxCheck != want {
+			t.Fatalf("TINYCODE_DISABLE_SYNTAX_CHECK=%q -> (%v, %v), want %v", raw, cfg.TN.DisableSyntaxCheck, err, want)
+		}
+	}
+	t.Setenv("TINYCODE_DISABLE_SYNTAX_CHECK", "maybe")
+	if _, err := Load(); err == nil {
+		t.Fatal("a value that is not a boolean must be rejected")
+	}
+	t.Setenv("TINYCODE_DISABLE_SYNTAX_CHECK", "")
+	t.Setenv("TINYCODE_REPO_MAP_CHARS", "0")
+	if cfg, err := Load(); err != nil || cfg.TN.RepoMapChars != 0 {
+		t.Fatalf("a zero map size (map off) must survive: (%d, %v)", cfg.TN.RepoMapChars, err)
+	}
 }
 
 func TestLoadReplacesBrokenValues(t *testing.T) {
