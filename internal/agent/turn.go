@@ -129,6 +129,8 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 			a.io.Println(i18n.T("agent.interrupted"))
 			return
 		}
+		a.syncEnvState()
+		a.tidyContext()
 		isLast := rnd == maxRounds-1
 
 		msg := a.callLLM(callOptions{silent: silent, useTools: !isLast})
@@ -801,10 +803,12 @@ func (a *Agent) Run() {
 		a.refreshBrief()
 		if a.planMode {
 			a.addMsg(Message{Role: "user", Content: userInput})
+			a.syncEnvState()
 			a.processPlanTurn()
 			a.handlePlanApproval()
 		} else {
 			a.addMsg(Message{Role: "user", Content: maybeGitHint(userInput)})
+			a.syncEnvState()
 			a.io.Println("")
 			a.processTurn(0, false)
 			a.io.Println("")
@@ -816,6 +820,7 @@ func (a *Agent) Run() {
 func (a *Agent) RunOnce(prompt string) {
 	a.refreshBrief()
 	a.addMsg(Message{Role: "user", Content: prompt})
+	a.syncEnvState()
 	a.io.Println("")
 	a.processTurn(0, false)
 	a.io.Println("")

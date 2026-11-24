@@ -63,11 +63,12 @@ func (a *Agent) callLLM(o callOptions) *Message {
 	return msg
 }
 
-// prepareMessages returns a trimmed, tool-result-cleared snapshot of the
-// conversation history, ready to hand to streamCompletion.
+// prepareMessages returns the conversation history, trimmed only when it
+// would not fit the context at all. Nothing in it is rewritten on the way:
+// the server reuses its KV cache by common prefix, so between two shrink
+// points (see tidyContext) the history has to stay append-only.
 func (a *Agent) prepareMessages() []Message {
-	trimmed := trimMessages(a.snapshotMessages(), a.ctx.maxTokens, a.ctx.reserve)
-	return clearOldToolResults(trimmed, keepFullToolResults)
+	return trimMessages(a.snapshotMessages(), a.ctx.maxTokens, a.ctx.reserve)
 }
 
 // streamCompletion streams one completion from already-prepared messages and
@@ -99,10 +100,8 @@ func (a *Agent) streamCompletion(ctx context.Context, messages []Message, o call
 		req.ToolChoice = "required"
 	}
 
-	if len(req.Messages) > 0 && req.Messages[0].Role == openai.ChatMessageRoleSystem {
-		req.Messages[0].Content = req.Messages[0].Content + "\n\n" + a.envState()
-	} else {
-		req.Messages = append([]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: a.envState()}}, req.Messages...)
+	if len(req.Messages) == 0 || req.Messages[0].Role != openai.ChatMessageRoleSystem {
+		req.Messages = append([]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: a.systemPrompt()}}, req.Messages...)
 	}
 
 	if o.forcePrompt != "" {

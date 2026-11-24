@@ -1,8 +1,13 @@
 package agent
 
 import (
+	"fmt"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/explorerTNT/TinyCode/internal/config"
 )
 
 func bigMessage(role, text string) Message {
@@ -113,5 +118,123 @@ func TestTruncateUTF8(t *testing.T) {
 	}
 	if got := truncateStr(s, 4); got != "жж" {
 		t.Fatalf("truncateStr cut a character: %q", got)
+	}
+}
+
+// memIO collects what the agent prints and never answers a prompt.
+type memIO struct{ lines []string }
+
+func (m *memIO) Printf(format string, args ...any) { m.Println(fmt.Sprintf(format, args...)) }
+func (m *memIO) Println(a ...any)                  { m.lines = append(m.lines, fmt.Sprintln(a...)) }
+func (m *memIO) Status(string)                     {}
+func (m *memIO) Input(string) (string, error)      { return "", io.EOF }
+
+func (m *memIO) text() string { return strings.Join(m.lines, "\n") }
+
+func historyAgent(contextLimit int) *Agent {
+	cfg := config.Default()
+	cfg.TN.ContextLimit = contextLimit
+	a := &Agent{config: cfg, io: &memIO{}, ctx: newContextManager(contextLimit)}
+	a.addMsg(Message{Role: "system", Content: "sys"})
+	return a
+}
+
+// toolExchange appends one call and its result of roughly 900 characters.
+func (a *Agent) toolExchange(i int) {
+	id := fmt.Sprintf("c%d", i)
+	a.addMsg(Message{Role: "assistant", ToolCalls: []ToolCall{{ID: id, Name: "read_file"}}})
+	a.addMsg(Message{Role: "tool", ToolCallID: id, Content: strings.Repeat("x", 900)})
+}
+
+// The server reuses its prompt cache by common prefix, so a request must
+// never differ from the history it is built from.
+func TestPrepareMessagesIsAppendOnly(t *testing.T) {
+	a := historyAgent(1_000_000)
+	for i := 0; i < 8; i++ {
+		a.toolExchange(i)
+	}
+	got := a.prepareMessages()
+	if len(got) != 17 {
+		t.Fatalf("got %d messages, want 17", len(got))
+	}
+	for _, m := range got {
+		if m.Role == "tool" && strings.Contains(m.Content, "cleared") {
+			t.Fatal("prepareMessages rewrote a tool result; that breaks the prompt cache on every call")
+		}
+	}
+}
+
+// Old tool results are cleared in one batch once the context is nearly
+// full, which costs the server a single cache miss instead of one per call.
+func TestTidyContextShrinksInOneBatch(t *testing.T) {
+	a := historyAgent(4096 + 1500)
+	for i := 0; i < 8; i++ {
+		a.toolExchange(i)
+	}
+	before := a.estimateTokens()
+	if before < 1350 {
+		t.Fatalf("test history is too small for the shrink to trigger: %d tokens", before)
+	}
+
+	a.tidyContext()
+	after := a.estimateTokens()
+	if after >= before || after >= 1500 {
+		t.Fatalf("history not shrunk below the budget: %d -> %d", before, after)
+	}
+	full, cleared := 0, 0
+	for _, m := range a.snapshotMessages() {
+		switch {
+		case m.Role != "tool":
+		case strings.Contains(m.Content, "cleared"):
+			cleared++
+		default:
+			full++
+		}
+	}
+	if full != 5 || cleared != 3 {
+		t.Fatalf("kept %d full results and cleared %d, want 5 and 3", full, cleared)
+	}
+	if !strings.Contains(a.io.(*memIO).text(), "older tool results cleared") {
+		t.Fatal("the user must see that the context was shrunk")
+	}
+
+	// Already below the threshold: nothing more happens, in particular no
+	// compaction call to the model.
+	a.tidyContext()
+	if got := a.estimateTokens(); got != after {
+		t.Fatalf("a second tidy changed the history: %d -> %d", after, got)
+	}
+}
+
+func TestTidyContextLeavesSmallHistoryAlone(t *testing.T) {
+	a := historyAgent(4096 + 1500)
+	a.toolExchange(0)
+	before := a.estimateTokens()
+	a.tidyContext()
+	if got := a.estimateTokens(); got != before || a.io.(*memIO).text() != "" {
+		t.Fatal("a small history must not be touched")
+	}
+}
+
+func TestSyncEnvStateOnlyWhenChanged(t *testing.T) {
+	ws := t.TempDir()
+	a := &Agent{workspace: ws}
+
+	a.syncEnvState()
+	a.syncEnvState()
+	if got := a.snapshotMessages(); len(got) != 1 {
+		t.Fatalf("unchanged state written twice: %d messages", len(got))
+	}
+
+	writeAgentFile(t, filepath.Join(ws, "new.go"), "package main\n")
+	a.syncEnvState()
+	got := a.snapshotMessages()
+	if len(got) != 2 || !strings.Contains(got[1].Content, "new.go") || !got[1].Nudge {
+		t.Fatalf("changed listing not recorded: %+v", got)
+	}
+	a.clearMessages()
+	a.syncEnvState()
+	if got := a.snapshotMessages(); len(got) != 1 {
+		t.Fatalf("after /clear the listing must be written again: %d messages", len(got))
 	}
 }

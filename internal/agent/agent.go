@@ -87,6 +87,8 @@ type Agent struct {
 	messages []Message
 	llmCalls int
 	ctx      *ContextManager
+	// lastEnvState is the environment listing last written into the history.
+	lastEnvState string
 
 	planMode bool
 	lastPlan string
@@ -284,7 +286,67 @@ func (a *Agent) envState() string {
 		}
 	}
 	lines = append(lines, "files here: "+listing)
-	return "ENVIRONMENT STATE\n" + strings.Join(lines, "\n")
+	return "ENVIRONMENT STATE (a note about the project folder, not a request)\n" + strings.Join(lines, "\n")
+}
+
+// syncEnvState writes the environment listing into the history whenever it
+// changed, for instance after the model created a file. It used to be glued
+// onto the system message for every request, so each new file invalidated
+// the server's prompt cache for the whole conversation.
+func (a *Agent) syncEnvState() {
+	state := a.envState()
+	if state == a.lastEnvState {
+		return
+	}
+	a.lastEnvState = state
+	a.addNudge(state)
+}
+
+// estimateTokens is the approximate token size of the stored history.
+func (a *Agent) estimateTokens() int {
+	a.msgMu.RLock()
+	defer a.msgMu.RUnlock()
+	total := 0
+	for _, m := range a.messages {
+		total += countMessageTokens(m)
+	}
+	return total
+}
+
+// tidyContext keeps the conversation append-only between fixed points.
+// llama.cpp and LM Studio reuse the KV cache by common prefix: rewriting an
+// old message makes the server re-process everything after it on every
+// following call, which on slow hardware costs minutes per round. Old tool
+// results are therefore cleared in one batch when the context is nearly
+// full, never one by one on every call; a summary compaction follows only
+// if even that is not enough.
+func (a *Agent) tidyContext() {
+	budget := a.config.TN.ContextLimit - a.ctx.reserve
+	if budget <= 0 || a.estimateTokens() < budget*9/10 {
+		return
+	}
+	if a.shrinkToolResults() {
+		a.io.Println(i18n.T("agent.context_trimmed"))
+	}
+	if a.estimateTokens() >= budget {
+		a.compactMessages()
+	}
+}
+
+// shrinkToolResults replaces all but the newest tool results in the stored
+// history with a placeholder and reports whether anything changed.
+func (a *Agent) shrinkToolResults() bool {
+	a.msgMu.Lock()
+	defer a.msgMu.Unlock()
+	shrunk := clearOldToolResults(a.messages, keepFullToolResults)
+	changed := false
+	for i := range shrunk {
+		if shrunk[i].Content != a.messages[i].Content {
+			a.messages[i].Content = shrunk[i].Content
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (a *Agent) addMsg(m Message) {
@@ -303,6 +365,7 @@ func (a *Agent) clearMessages() {
 	a.msgMu.Lock()
 	defer a.msgMu.Unlock()
 	a.messages = nil
+	a.lastEnvState = ""
 }
 
 // snapshotMessages returns a deep copy of the current message history without
