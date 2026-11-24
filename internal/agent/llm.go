@@ -13,6 +13,7 @@ import (
 	"github.com/sashabaranov/go-openai"
 
 	"github.com/explorerTNT/TinyCode/internal/i18n"
+	"github.com/explorerTNT/TinyCode/internal/llm"
 )
 
 type callOptions struct {
@@ -133,7 +134,7 @@ func (a *Agent) reportStreamError(err error) {
 	var apiErr *openai.APIError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		a.io.Println(i18n.T("llm.stalled"))
+		a.io.Println(i18n.T("llm.stalled", a.config.TN.StallTimeout))
 	case errors.As(err, &apiErr):
 		switch apiErr.HTTPStatusCode {
 		case 429:
@@ -193,9 +194,9 @@ func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletion
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				return nil
 			}
-			if errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(err, llm.ErrStalled) || errors.Is(err, context.DeadlineExceeded) {
 				if !silent {
-					a.io.Println(i18n.T("llm.stalled"))
+					a.io.Println(i18n.T("llm.stalled", a.config.TN.StallTimeout))
 				}
 				return nil
 			}

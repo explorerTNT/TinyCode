@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/explorerTNT/TinyCode/internal/config"
 	"github.com/explorerTNT/TinyCode/internal/i18n"
@@ -97,7 +98,7 @@ func New(cfg *config.Config, io IO) (*Agent, error) {
 
 	a := &Agent{
 		config:    cfg,
-		client:    llm.NewClient(baseURL),
+		client:    llm.NewClient(baseURL, time.Duration(cfg.TN.StallTimeout)*time.Second),
 		io:        io,
 		workspace: workspace,
 	}
