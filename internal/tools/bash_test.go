@@ -29,11 +29,12 @@ func TestQuoteExistingPaths(t *testing.T) {
 	ws := t.TempDir()
 	writeFileAt(t, filepath.Join(ws, "my file.txt"), "x")
 	writeFileAt(t, filepath.Join(ws, "build", "x.o"), "x")
+	writeFileAt(t, filepath.Join(ws, "src", "main.go"), "x")
 
 	cases := map[string]string{
 		// The command itself is never quoted, even when a folder shares its name.
 		"build":                 "build",
-		"go build ./...":        `go "build" "./..."`,
+		"go build ./src":        `go "build" "./src"`,
 		`type "my file.txt"`:    `type "my file.txt"`,
 		"type my file.txt":      `type "my file.txt"`,
 		"type missing file.txt": "type missing file.txt",

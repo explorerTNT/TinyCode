@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !unix
 
 package tools
 
@@ -11,5 +11,5 @@ import (
 // setKillTree is a no-op: exec's default kill already stops the shell.
 func setKillTree(*exec.Cmd) {}
 
-// systemEncoding is nil: POSIX tools are assumed to write UTF-8.
+// systemEncoding is nil: tools are assumed to write UTF-8.
 func systemEncoding() encoding.Encoding { return nil }
