@@ -21,6 +21,16 @@ func TestCompare(t *testing.T) {
 		// dev version fallback
 		{"dev", "v1.0.0", -1},
 		{"v1.0.0", "dev", 1},
+		// CI development builds: ahead of their own tag, behind the next release
+		{"v0.4.0-3-gabc1234", "v0.4.0", 1},
+		{"v0.4.0", "v0.4.0-3-gabc1234", -1},
+		{"v0.4.0-3-gabc1234", "v0.4.1", -1},
+		{"v0.4.1", "v0.4.0-3-gabc1234", 1},
+		{"v0.4.0-3-gabc1234", "v0.4.0-4-gdef5678", -1},
+		{"v0.4.0-5-gabc1234", "v0.4.0-3-gabc1234", 1},
+		{"v0.4.0-3-gabc1234", "v0.4.0-3-gabc1234", 0},
+		{"v0.4.0-3-gabc1234-dirty", "v0.4.0", 1},
+		{"v0.4.0-3-gabc1234", "dev", 1},
 	}
 
 	for _, tt := range tests {

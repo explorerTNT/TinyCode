@@ -1,10 +1,13 @@
 package updater
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,10 +82,36 @@ func CheckLatest() (*Release, error) {
 	}, nil
 }
 
-// Compare returns -1, 0, or 1 comparing semver strings a and b.
-// Versions without a "v" prefix get one added automatically.
+// describeRe matches the version CI stamps into development builds:
+// "<tag>-<commits since the tag>-g<hash>".
+var describeRe = regexp.MustCompile(`^v?(\d+\.\d+\.\d+)-(\d+)-g[0-9a-f]+(?:-dirty)?$`)
+
+// Compare returns -1, 0, or 1 comparing versions a and b.
+// Versions without a "v" prefix get one added automatically. A development
+// build counts as newer than the tag it was cut after and older than any
+// later release, so it is never offered a "downgrade" to its own tag.
 // Non-semver strings fall back to lexicographic comparison.
 func Compare(a, b string) int {
+	tagA, aheadA, devA := parseDescribe(a)
+	tagB, aheadB, devB := parseDescribe(b)
+	switch {
+	case devA && devB:
+		if c := semver.Compare(ensureVPrefix(tagA), ensureVPrefix(tagB)); c != 0 {
+			return c
+		}
+		return cmp.Compare(aheadA, aheadB)
+	case devA:
+		if c := semver.Compare(ensureVPrefix(tagA), ensureVPrefix(b)); c != 0 {
+			return c
+		}
+		return 1
+	case devB:
+		if c := semver.Compare(ensureVPrefix(a), ensureVPrefix(tagB)); c != 0 {
+			return c
+		}
+		return -1
+	}
+
 	sa := ensureVPrefix(a)
 	sb := ensureVPrefix(b)
 
@@ -98,6 +127,20 @@ func Compare(a, b string) int {
 		return 1
 	}
 	return 0
+}
+
+// parseDescribe splits a git-describe version into its tag and the number
+// of commits after it. ok is false for an ordinary version.
+func parseDescribe(v string) (tag string, ahead int, ok bool) {
+	m := describeRe.FindStringSubmatch(v)
+	if m == nil {
+		return "", 0, false
+	}
+	ahead, err := strconv.Atoi(m[2])
+	if err != nil {
+		return "", 0, false
+	}
+	return m[1], ahead, true
 }
 
 func ensureVPrefix(v string) string {

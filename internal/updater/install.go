@@ -4,18 +4,25 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
 )
 
-// Install downloads the release archive for the current platform and replaces
-// the running binary. It is safe to call from a goroutine.
+// checksumsAsset is published with every release by the release workflow.
+const checksumsAsset = "SHA256SUMS.txt"
+
+// Install downloads the release archive for the current platform, checks it
+// against the checksums published with the release, and replaces the running
+// binary. It is safe to call from a goroutine.
 func Install(release *Release) error {
 	if release == nil {
 		return fmt.Errorf("no release provided")
@@ -26,7 +33,7 @@ func Install(release *Release) error {
 		return err
 	}
 
-	bin, err := downloadAndExtract(asset)
+	bin, err := downloadAndExtract(asset, release)
 	if err != nil {
 		return err
 	}
@@ -56,21 +63,13 @@ func findAsset(release *Release) (*Asset, error) {
 	return nil, fmt.Errorf("no asset found for %s/%s in release %s", goos, goarch, release.Tag)
 }
 
-func downloadAndExtract(asset *Asset) ([]byte, error) {
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(asset.BrowserDownloadURL)
+func downloadAndExtract(asset *Asset, release *Release) ([]byte, error) {
+	data, err := download(asset.BrowserDownloadURL)
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("download %s: status %d", asset.Name, resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("download read: %w", err)
+	if err := verifyChecksum(release, asset.Name, data); err != nil {
+		return nil, err
 	}
 
 	if strings.HasSuffix(asset.Name, ".zip") {
@@ -83,6 +82,78 @@ func downloadAndExtract(asset *Asset) ([]byte, error) {
 	// Bare binary (no archive).
 	return data, nil
 }
+
+func download(url string) ([]byte, error) {
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("download read: %w", err)
+	}
+	return data, nil
+}
+
+// verifyChecksum compares the archive with its line in SHA256SUMS.txt. A
+// release without checksums is refused: an unverified binary must not
+// replace the running one.
+func verifyChecksum(release *Release, name string, data []byte) error {
+	sums, err := findAssetNamed(release, checksumsAsset)
+	if err != nil {
+		return err
+	}
+	text, err := download(sums.BrowserDownloadURL)
+	if err != nil {
+		return fmt.Errorf("checksums: %w", err)
+	}
+	want, err := checksumFor(string(text), name)
+	if err != nil {
+		return err
+	}
+
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("checksum mismatch for %s: expected %s, got %s", name, want, got)
+	}
+	return nil
+}
+
+func findAssetNamed(release *Release, name string) (*Asset, error) {
+	for i := range release.Assets {
+		if release.Assets[i].Name == name {
+			return &release.Assets[i], nil
+		}
+	}
+	return nil, fmt.Errorf("release %s has no %s, refusing to install an unverified binary", release.Tag, name)
+}
+
+// checksumFor reads the hash of name out of a sha256sum listing, where a
+// line is "<hash>  <name>" or "<hash> *<name>" in binary mode.
+func checksumFor(sums, name string) (string, error) {
+	for _, line := range strings.Split(sums, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || strings.TrimPrefix(fields[1], "*") != name {
+			continue
+		}
+		if sum := strings.ToLower(fields[0]); isSHA256(sum) {
+			return sum, nil
+		}
+	}
+	return "", fmt.Errorf("%s has no entry for %s", checksumsAsset, name)
+}
+
+var reSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func isSHA256(s string) bool { return reSHA256.MatchString(s) }
 
 func extractZip(data []byte) ([]byte, error) {
 	r, err := zip.NewReader(strings.NewReader(string(data)), int64(len(data)))
