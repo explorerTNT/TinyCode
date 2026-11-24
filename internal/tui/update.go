@@ -38,6 +38,7 @@ func isUpdateCommand(value string) bool {
 // update is already in progress.
 func (m *model) beginUpdate(raw string) tea.Cmd {
 	if m.updateRunning {
+		m.appendLog(i18n.T("update.busy"))
 		return nil
 	}
 	m.updateRunning = true

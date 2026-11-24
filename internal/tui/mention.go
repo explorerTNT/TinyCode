@@ -101,7 +101,7 @@ func mentionFileInline(abs, content string) string {
 		if idx := strings.LastIndexByte(cut, '\n'); idx > 0 {
 			cut = cut[:idx]
 		}
-		return fmt.Sprintf("<%s>\n%s\n[file truncated: showing first %d bytes; use @%s#L to read a specific range]",
+		return fmt.Sprintf("<%s>\n%s\n[file truncated: showing first %d bytes; use @%s#10-40 to read a specific range]",
 			rel, cut, len(cut), rel)
 	}
 	return fmt.Sprintf("<%s>\n%s", rel, content)
@@ -120,10 +120,21 @@ func mentionLineRange(abs, content string, start, end int) string {
 	if end > total {
 		end = total
 	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "<%s> (lines %d-%d of %d)\n", rel, start, end, total)
+	shown := start
 	for i := start; i <= end; i++ {
-		fmt.Fprintf(&b, "%d: %s\n", i, lines[i-1])
+		entry := fmt.Sprintf("%d: %s\n", i, lines[i-1])
+		// One mention must not swallow the whole context window.
+		if i > start && b.Len()+len(entry) > mentionMaxBytes {
+			break
+		}
+		b.WriteString(entry)
+		shown = i
+	}
+	if shown < end {
+		fmt.Fprintf(&b, "[mention truncated at line %d; use @%s#%d-%d for the rest]", shown, rel, shown+1, end)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

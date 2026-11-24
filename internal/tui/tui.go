@@ -178,12 +178,16 @@ type model struct {
 
 	fileIndex []fileRef
 
-	answerCh    chan string
-	input       *input
-	inputActive bool
-	sideMode    bool
-	prompt      string
-	ac          *autocomplete
+	answerCh chan string
+	input    *input
+	// inputActive is set while the input box takes keystrokes. answerPending
+	// is set only when the agent is really waiting for them: the box also
+	// opens for a mention inserted while the agent is busy.
+	inputActive   bool
+	answerPending bool
+	sideMode      bool
+	prompt        string
+	ac            *autocomplete
 
 	updateRunning bool
 
@@ -259,6 +263,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case enableInputMsg:
 		m.prompt = msg.prompt
 		m.inputActive = true
+		m.answerPending = true
 		m.sideMode = false
 		m.input.Reset()
 		m.input.Focus()
@@ -316,6 +321,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		case "esc":
 			m.prompt = ""
 			m.inputActive = false
+			m.answerPending = false
 			m.input.Reset()
 			m.input.Blur()
 			m.ac.hide()
@@ -493,14 +499,22 @@ func (m *model) submitInput() tea.Cmd {
 		value = resolveMentions(value, m.cfg.TN.Workspace)
 	}
 
+	// /update answers nothing: the agent is still waiting for its prompt,
+	// so the input stays open for the real request instead of leaving the
+	// agent blocked on an answer that never comes.
+	if isUpdateCommand(value) {
+		m.input.Reset()
+		m.ac.hide()
+		m.updateHint()
+		return m.beginUpdate(raw)
+	}
+
 	m.input.Reset()
 	m.input.Blur()
 	m.inputActive = false
+	m.answerPending = false
 	m.ac.hide()
 	m.prompt = ""
-	if isUpdateCommand(value) {
-		return m.beginUpdate(raw)
-	}
 	if value != "" {
 		m.appendLog(">>> " + raw)
 	}
@@ -515,14 +529,16 @@ func (m *model) exitSideMode() {
 	m.input.Blur()
 }
 
-// parseBtw extracts the question from a /btw value. ok is false when the value
-// is not a valid /btw request.
+// parseBtw extracts the question from a /btw value. ok is false when the
+// value is not a valid /btw request. The marker may sit anywhere in the
+// text, so a file mention inserted ahead of it still works.
 func parseBtw(value string) (string, bool) {
 	v := strings.TrimSpace(value)
-	if !strings.HasPrefix(v, "/btw") {
+	i := strings.Index(v, "/btw")
+	if i < 0 || (i > 0 && v[i-1] != ' ') || (i+4 < len(v) && v[i+4] != ' ') {
 		return "", false
 	}
-	q := strings.TrimSpace(strings.TrimPrefix(v, "/btw"))
+	q := strings.Join(strings.Fields(v[:i]+" "+v[i+4:]), " ")
 	if q == "" {
 		return "", false
 	}
@@ -1148,10 +1164,18 @@ func (m *model) insertMention(n *treeNode) tea.Cmd {
 	}
 	mention := "@" + filepath.ToSlash(rel) + " "
 	if !m.inputActive {
-		m.prompt = ""
-		m.inputActive = true
 		m.input.Reset()
 		m.input.Focus()
+		if m.answerPending {
+			// The agent is waiting for this very input.
+			m.inputActive = true
+		} else {
+			// The agent is busy: the mention goes to the side-question
+			// input. A value sent to answerCh now would be eaten later by
+			// whatever prompt the agent asks next, such as a permission
+			// request, and the user's text would be lost.
+			m.sideMode = true
+		}
 	}
 	m.input.SetValue(m.input.Value() + mention)
 	m.input.Focus()

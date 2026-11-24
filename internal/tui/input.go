@@ -57,7 +57,7 @@ func (i *input) Update(msg tea.Msg) tea.Cmd {
 	}
 	switch key.Type {
 	case tea.KeyRunes:
-		i.insert(key.Runes)
+		i.insert(typedRunes(key.Runes))
 		i.errorText = ""
 	case tea.KeySpace:
 		i.insert([]rune{' '})
@@ -101,13 +101,32 @@ func (i *input) insert(runes []rune) {
 	i.cursor += len(runes)
 }
 
+// typedRunes drops what would break the one-line input: the bracketed-paste
+// markers, escape sequences and control characters of a pasted terminal
+// selection. Line breaks and tabs become spaces.
+func typedRunes(runes []rune) []rune {
+	s := strings.ReplaceAll(string(runes), "\x1b[200~", "")
+	s = strings.ReplaceAll(s, "\x1b[201~", "")
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			out = append(out, ' ')
+		case r >= 0x20:
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 func (i *input) acceptCompletion() {
 	if i.completion == "" {
 		return
 	}
-	cur := i.Value()
-	if i.cursor == len(cur) && len(i.completion) > len(cur) {
-		i.insert([]rune(i.completion[len(cur):]))
+	// The cursor counts characters, so the suffix is cut by characters too,
+	// and only a real prefix of the completion is completed.
+	if i.cursor == len(i.value) && strings.HasPrefix(i.completion, i.Value()) {
+		i.insert([]rune(i.completion)[i.cursor:])
 	}
 	i.completion = ""
 }
