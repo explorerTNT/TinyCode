@@ -77,7 +77,7 @@ func main() {
 		if updateEnabled {
 			go checkUpdate()
 		}
-		runOnce(cfg, prompt)
+		runOnce(cfg, prompt, *resume, *session)
 		return
 	}
 
@@ -99,12 +99,17 @@ func main() {
 	}
 }
 
-func runOnce(cfg *config.Config, prompt string) {
+// runOnce answers a single prompt. With resume set the named (or latest)
+// session is restored first, the same way the TUI does for -resume.
+func runOnce(cfg *config.Config, prompt string, resume bool, session string) {
 	io := agent.NewConsoleIO()
 	ag, err := agent.New(cfg, io)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", i18n.T("main.agent_error", err))
 		os.Exit(1)
+	}
+	if resume && !ag.ResumeSession(session) {
+		fmt.Fprintln(os.Stderr, strings.TrimSpace(i18n.T("main.no_session")))
 	}
 	ag.RunOnce(prompt)
 }
