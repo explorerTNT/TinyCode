@@ -134,7 +134,7 @@ func (a *Agent) reportStreamError(err error) {
 	var apiErr *openai.APIError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		a.io.Println(i18n.T("llm.stalled", a.config.TN.StallTimeout))
+		a.io.Println(i18n.T("llm.stalled", a.stallSeconds()))
 	case errors.As(err, &apiErr):
 		switch apiErr.HTTPStatusCode {
 		case 429:
@@ -196,7 +196,7 @@ func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletion
 			}
 			if errors.Is(err, llm.ErrStalled) || errors.Is(err, context.DeadlineExceeded) {
 				if !silent {
-					a.io.Println(i18n.T("llm.stalled", a.config.TN.StallTimeout))
+					a.io.Println(i18n.T("llm.stalled", a.stallSeconds()))
 				}
 				return nil
 			}
@@ -210,6 +210,7 @@ func (a *Agent) processStream(ctx context.Context, stream *openai.ChatCompletion
 		}
 		if chunk.Usage != nil {
 			usage = chunk.Usage
+			a.addUsage(usage.PromptTokens, usage.CompletionTokens)
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -332,19 +333,11 @@ func buildFromStream(content string, toolCalls map[int]*streamToolCall, finish o
 	truncated := false
 	for _, idx := range keys {
 		tc := toolCalls[idx]
-		rawArgs := tc.args
-		var parsed any
-		if rawArgs != "" {
-			parsed = safeJSONLoads(rawArgs)
-		}
-		if rawArgs != "" && finish == openai.FinishReasonLength {
-			truncated = true
-		} else if rawArgs != "" {
-			var v any
-			if err := json.Unmarshal([]byte(rawArgs), &v); err != nil {
-				truncated = true
-			}
-		}
+		// A call is cut off when generation stopped at the token limit or
+		// its arguments had to be completed by the JSON repair. A merely
+		// untidy object (trailing comma, single quotes) is still complete.
+		parsed, closed, _ := parseToolArgs(tc.args)
+		truncated = truncated || closed || finish == openai.FinishReasonLength
 
 		argsJSON := "{}"
 		if parsed != nil {

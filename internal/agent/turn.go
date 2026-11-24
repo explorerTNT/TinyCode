@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/explorerTNT/TinyCode/internal/i18n"
 )
@@ -15,8 +16,31 @@ import (
 var (
 	doneMarker  = regexp.MustCompile(`(?im)^\s*[*_` + "`" + `#\s]*task\s+complete[*_` + "`" + `.!\s]*$`)
 	donePhrases = regexp.MustCompile(`(?i)(задача\s+выполнена|задание\s+выполнено|вс[ёе]\s+готово|вс[ёе]\s+сделано|task\s+is\s+complete|implementation\s+is\s+complete|all\s+steps\s+are\s+done)`)
-	negation    = regexp.MustCompile(`(?i)\b(не|not|н[ие]т|cannot|can't|failed|ошибка|error)\b`)
+	// RE2's \b only sees ASCII word characters, so next to Cyrillic it never
+	// fires and a Russian "не готово" passed as done. The boundaries are
+	// spelled out with Unicode classes instead.
+	negation = regexp.MustCompile(`(?i)(^|[^\p{L}\p{N}])(не|нет|not|cannot|can't|fail\p{L}*|ошибк\p{L}*|error[s]?)([^\p{L}\p{N}]|$)`)
 )
+
+// Outcomes of an agent turn, for callers that measure the agent.
+const (
+	OutcomeRespond     = "respond"     // the model called respond
+	OutcomeDone        = "done"        // the model announced the task is complete
+	OutcomeRepeated    = "repeated"    // the model kept repeating itself
+	OutcomeStuck       = "stuck"       // reasoning without any output
+	OutcomeMaxRounds   = "max_rounds"  // the tool-round budget ran out
+	OutcomeNoResponse  = "no_response" // the model server gave nothing usable
+	OutcomeInterrupted = "interrupted" // the user stopped the turn
+)
+
+// TurnResult summarises the last processTurn call.
+type TurnResult struct {
+	Outcome    string
+	Rounds     int
+	ToolCalls  int
+	ToolErrors int
+	Tools      map[string]int // successful calls per tool
+}
 
 func looksDone(text string) bool {
 	if text == "" {
@@ -26,17 +50,10 @@ func looksDone(text string) bool {
 		return true
 	}
 	tail := text
-	if len(tail) > 300 {
-		tail = tail[len(tail)-300:]
+	if r := []rune(text); len(r) > 300 {
+		tail = string(r[len(r)-300:])
 	}
 	return donePhrases.MatchString(tail) && !negation.MatchString(tail)
-}
-
-func argsMap(v any) map[string]any {
-	if m, ok := v.(map[string]any); ok {
-		return m
-	}
-	return map[string]any{}
 }
 
 func shortArgs(args map[string]any, maxLen int) string {
@@ -102,8 +119,13 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 	textOnlyRounds := 0
 	a.aborted.Store(false)
 
+	res := &TurnResult{Outcome: OutcomeMaxRounds, Tools: map[string]int{}}
+	defer func() { a.lastTurn.Store(res) }()
+
 	for rnd := 0; rnd < maxRounds; rnd++ {
+		res.Rounds = rnd + 1
 		if a.aborted.Load() {
+			res.Outcome = OutcomeInterrupted
 			a.io.Println(i18n.T("agent.interrupted"))
 			return
 		}
@@ -111,12 +133,14 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 
 		msg := a.callLLM(callOptions{silent: silent, useTools: !isLast})
 		if a.aborted.Load() {
+			res.Outcome = OutcomeInterrupted
 			a.io.Println(i18n.T("agent.interrupted"))
 			return
 		}
 		if msg == nil {
 			msg = a.callLLM(callOptions{silent: silent, forcePrompt: "Continue with the next step."})
 			if msg == nil {
+				res.Outcome = OutcomeNoResponse
 				a.io.Println(i18n.T("agent.no_response"))
 				return
 			}
@@ -143,13 +167,16 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 			textOnlyRounds = 0
 			if len(tcList) > maxCallsPerRound {
 				a.io.Println(i18n.T("agent.too_many_calls", len(tcList), maxCallsPerRound))
+				// Every call needs a result: a call without one makes the
+				// next request invalid for strict servers.
+				for _, tc := range tcList[maxCallsPerRound:] {
+					a.addMsg(Message{Role: "tool", ToolCallID: tc.ID, Content: skippedCallResult})
+				}
 				tcList = tcList[:maxCallsPerRound]
 			}
 			for _, tc := range tcList {
 				name := tc.Name
-				rawArgs := tc.Arguments
-				parsed := safeJSONLoads(rawArgs)
-				args := argsMap(parsed)
+				args := decodeArgs(tc.Arguments)
 
 				if name == respondToolName {
 					answer := strings.TrimSpace(strArg(args, "message"))
@@ -158,32 +185,43 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 					} else {
 						a.io.Println("")
 					}
+					res.Outcome = OutcomeRespond
 					return
 				}
 
 				a.io.Println(i18n.T("agent.tool_line", rnd+1, maxRounds, name, shortArgs(args, 60)))
 
+				res.ToolCalls++
 				var result string
-				if msg.Truncated && (name == writeToolsFile || name == editToolsFile) {
+				switch {
+				case a.aborted.Load():
+					// Pair the call with a result, but run nothing more after
+					// the user pressed stop.
+					result = "Error: interrupted by the user, the call was not executed."
+				case msg.Truncated && (name == writeToolsFile || name == editToolsFile):
 					result = a.truncatedWriteResult(args)
-				} else {
+				case msg.Truncated && name == runBashTool:
+					result = "Error: your tool call was cut off mid-generation, so the command is incomplete and was NOT run. Run a shorter command or split the work into smaller steps."
+				default:
 					result = a.executeTool(name, args)
 				}
 
 				if strings.HasPrefix(result, "Error:") {
+					res.ToolErrors++
 					a.io.Println(i18n.T("agent.tool_error", result))
 					recentErrors = append(recentErrors, fmt.Sprintf("%s: %s", name, truncateStr(result, 200)))
 					if len(recentErrors) > 8 {
 						recentErrors = recentErrors[1:]
 					}
 				} else {
+					res.Tools[name]++
 					didWork = true
 					preview := strings.ReplaceAll(truncateStr(result, 120), "\n", " ")
 					a.io.Println(i18n.T("agent.tool_result", len(result), preview))
 				}
 
 				if len(result) > toolResultCap {
-					result = result[:toolResultCap] +
+					result = truncateUTF8(result, toolResultCap) +
 						"\n\n[truncated at 4000 chars. Use a narrower search or read a specific line range.]"
 				}
 				a.addMsg(Message{Role: "tool", ToolCallID: tc.ID, Content: result})
@@ -213,13 +251,14 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 						seen = seen[len(seen)-4:]
 					}
 					errBlock := strings.Join(seen, "\n")
-					a.addMsg(Message{Role: "user", Content: "You have called `" + name + "` over and over without making progress. Errors you got:\n" + errBlock + "\nSTOP using `" + name + "`. You already have everything you need: write the code yourself from your own knowledge, then run it. Do not search the web for this task."})
+					a.addNudge("You have called `" + name + "` over and over without making progress. Errors you got:\n" + errBlock + "\nSTOP using `" + name + "`. You already have everything you need: write the code yourself from your own knowledge, then run it. Do not search the web for this task.")
 					recentTools = nil
 					recentErrors = nil
 				}
 			}
 		} else if content != "" {
 			if msg.Cut == "repetition" {
+				res.Outcome = OutcomeRepeated
 				a.io.Println(i18n.T("agent.finished_repeat"))
 				return
 			}
@@ -238,26 +277,30 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 					lastContentNorm = norm
 				}
 				if repeatCount >= 2 {
+					res.Outcome = OutcomeRepeated
 					a.io.Println(i18n.T("agent.repeating_answer"))
 					return
 				}
 			}
 
 			if looksDone(cleanContent) {
+				res.Outcome = OutcomeDone
 				a.io.Println("")
 				return
 			}
 
 			if didWork && textOnlyRounds >= 1 {
+				res.Outcome = OutcomeDone
 				a.io.Println(i18n.T("agent.text_twice"))
 				return
 			}
 
 			textOnlyRounds++
-			a.addMsg(Message{Role: "user", Content: "If the task is fully done, reply with exactly TASK COMPLETE on its own line. Otherwise call the next tool now. Do not repeat your previous message."})
+			a.addNudge("If the task is fully done, reply with exactly TASK COMPLETE on its own line. Otherwise call the next tool now. Do not repeat your previous message.")
 		} else {
 			reasoningRounds++
 			if reasoningRounds > 2 {
+				res.Outcome = OutcomeStuck
 				a.io.Println(i18n.T("agent.stuck_reasoning"))
 				return
 			}
@@ -328,11 +371,23 @@ func dedupStrings(in []string) []string {
 	return out
 }
 
+// skippedCallResult answers a tool call the agent dropped for exceeding
+// maxCallsPerRound.
+const skippedCallResult = "Error: skipped, you sent more than 3 tool calls at once. Send one call per step."
+
 func truncateStr(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	return truncateUTF8(s, n)
+}
+
+// truncateUTF8 cuts s to at most n bytes without splitting a character.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // ---- plan mode ----
@@ -378,11 +433,14 @@ func (a *Agent) processPlanTurn() {
 		}
 
 		if len(tcList) > maxCallsPerRound {
+			for _, tc := range tcList[maxCallsPerRound:] {
+				a.addMsg(Message{Role: "tool", ToolCallID: tc.ID, Content: skippedCallResult})
+			}
 			tcList = tcList[:maxCallsPerRound]
 		}
 		for _, tc := range tcList {
 			name := tc.Name
-			args := argsMap(safeJSONLoads(tc.Arguments))
+			args := decodeArgs(tc.Arguments)
 
 			if name == respondToolName {
 				plan := stripXMLToolCalls(strArg(args, "message"))
@@ -409,7 +467,7 @@ func (a *Agent) processPlanTurn() {
 			}
 			if blockedWrites >= 2 {
 				blockedWrites = 0
-				a.addMsg(Message{Role: "user", Content: "You are in PLAN MODE. Writing files and running commands is impossible here - those tools stay disabled no matter how you call them. Do not attempt them again. Output the numbered plan as plain text right now; the code itself will be written after the plan is approved."})
+				a.addNudge("You are in PLAN MODE. Writing files and running commands is impossible here - those tools stay disabled no matter how you call them. Do not attempt them again. Output the numbered plan as plain text right now; the code itself will be written after the plan is approved.")
 			}
 		}
 	}
@@ -592,8 +650,6 @@ func (a *Agent) handleSessionCommand(cmd string) bool {
 			a.msgMu.Lock()
 			a.messages = data.Messages
 			a.planMode = data.PlanMode
-			a.ctx.reset()
-			a.ctx.pushAll(a.messages)
 			a.msgMu.Unlock()
 			a.io.Println(i18n.T("session.resumed", data.Name, len(a.messages)))
 			return true

@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,20 +48,60 @@ func newSessionManager(workspace string) (*SessionManager, error) {
 	return &SessionManager{workspace: workspace, sessionDir: sessionDir, plansDir: plansDir}, nil
 }
 
+// safePath maps a session name to its file. Names that lose characters on
+// the way get a short hash, so two different names cannot share one file.
 func (s *SessionManager) safePath(name string) string {
+	return filepath.Join(s.sessionDir, sanitizeName(name)+".json")
+}
+
+// legacyPath is the file name safePath produced before sanitised names were
+// hashed; sessions saved by older versions live there.
+func (s *SessionManager) legacyPath(name string) string {
+	safe, _ := sanitizeBase(name)
+	return filepath.Join(s.sessionDir, safe+".json")
+}
+
+func sanitizeName(name string) string {
+	safe, changed := sanitizeBase(name)
+	if changed {
+		sum := sha256.Sum256([]byte(name))
+		safe += "-" + hex.EncodeToString(sum[:4])
+	}
+	return safe
+}
+
+// sanitizeBase keeps letters, digits, '-' and '_' and replaces the rest.
+// changed reports that characters were replaced, meaning another name could
+// sanitise to the same text.
+func sanitizeBase(name string) (string, bool) {
 	var b strings.Builder
+	changed := false
 	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-' || r == '_':
 			b.WriteRune(r)
-		} else {
+		default:
 			b.WriteRune('_')
+			changed = true
 		}
 	}
 	safe := strings.TrimSpace(b.String())
 	if safe == "" {
-		safe = "session"
+		return "session", false
 	}
-	return filepath.Join(s.sessionDir, safe+".json")
+	// DOS device names still cannot be file names on Windows.
+	if len(safe) <= 4 && reservedName[safe] {
+		safe = "_" + safe
+	}
+	return safe, changed
+}
+
+var reservedName = map[string]bool{
+	"nul": true, "con": true, "aux": true, "prn": true,
+	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,
+	"com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
+	"lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
 }
 
 func (s *SessionManager) save(name string, messages []Message, planMode bool, model, workspace string) (string, error) {
@@ -80,6 +123,9 @@ func (s *SessionManager) save(name string, messages []Message, planMode bool, mo
 func (s *SessionManager) load(name string) (*sessionData, error) {
 	path := s.safePath(name)
 	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) && path != s.legacyPath(name) {
+		b, err = os.ReadFile(s.legacyPath(name))
+	}
 	if err != nil {
 		return nil, err
 	}

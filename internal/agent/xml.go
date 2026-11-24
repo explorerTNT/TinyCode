@@ -40,23 +40,20 @@ func parseXMLToolCalls(content string) []ToolCall {
 			case '}':
 				braceDepth--
 				if braceDepth == 0 && start >= 0 {
-					parsed := safeJSONLoads(text[start : i+1])
-					if parsed != nil {
-						if obj, ok := parsed.(map[string]any); ok {
-							name, _ := obj["name"].(string)
-							args := obj["arguments"]
-							if args == nil {
-								args = obj["parameters"]
-							}
-							if argsObj, ok := args.(map[string]any); ok {
-								b, _ := json.Marshal(argsObj)
-								calls = append(calls, ToolCall{
-									ID:        "xml_call_" + itoa(len(calls)),
-									Type:      "function",
-									Name:      name,
-									Arguments: string(b),
-								})
-							}
+					if obj, _, ok := parseToolArgs(text[start : i+1]); ok {
+						name, _ := obj["name"].(string)
+						args := obj["arguments"]
+						if args == nil {
+							args = obj["parameters"]
+						}
+						if argsObj, ok := args.(map[string]any); ok {
+							b, _ := json.Marshal(argsObj)
+							calls = append(calls, ToolCall{
+								ID:        "xml_call_" + itoa(len(calls)),
+								Type:      "function",
+								Name:      name,
+								Arguments: string(b),
+							})
 						}
 					}
 					start = -1

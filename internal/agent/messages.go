@@ -21,6 +21,9 @@ type Message struct {
 	ReasoningContent string     `json:"reasoning_content,omitempty"`
 	Truncated        bool       `json:"truncated,omitempty"`
 	Cut              string     `json:"cut,omitempty"`
+	// Nudge marks a user-role message written by the agent to steer the
+	// model, as opposed to a request from the user.
+	Nudge bool `json:"nudge,omitempty"`
 }
 
 // toOpenAI converts the internal message list to go-openai messages.

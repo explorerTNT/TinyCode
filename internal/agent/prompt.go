@@ -1,21 +1,61 @@
 package agent
 
-// SYSTEM_PROMPT is the main system prompt for the coding agent.
-const SYSTEM_PROMPT = `You are tiny-code, a lightweight AI coding agent running on-device.
+import (
+	"fmt"
+	"runtime"
+)
 
-ENVIRONMENT: Windows. PowerShell, not bash.
-- ` + "`python`" + ` not ` + "`python3`" + `. ` + "`pip`" + ` not ` + "`pip3`" + `.
-- ` + "`Get-ChildItem`" + ` not ` + "`ls`" + `. ` + "`Get-Content`" + ` not ` + "`cat`" + `. ` + "`Select-String`" + ` not ` + "`grep`" + `.
-- Never use: bash, sh, uname, /bin/, /usr/, /etc/, head, tail, awk, sed, /dev/null.
+// SYSTEM_PROMPT is the main system prompt for the coding agent, built for
+// the platform the agent runs on.
+var SYSTEM_PROMPT = buildSystemPrompt(runtime.GOOS)
+
+type shellEnv struct {
+	os, shell string
+	python    string
+	mappings  string
+	banned    string
+	rootPath  string
+}
+
+var powershellEnv = shellEnv{
+	os:     "Windows",
+	shell:  "PowerShell, not bash",
+	python: "python",
+	mappings: "`python` not `python3`. `pip` not `pip3`.\n" +
+		"- `Get-ChildItem` not `ls`. `Get-Content` not `cat`. `Select-String` not `grep`.",
+	banned:   "bash, sh, uname, /bin/, /usr/, /etc/, head, tail, awk, sed, /dev/null",
+	rootPath: "C:/Users/...",
+}
+
+var posixEnv = shellEnv{
+	os:     "Linux or macOS",
+	shell:  "POSIX shell (sh), not PowerShell",
+	python: "python3",
+	mappings: "`python3` not `python`. `pip3` not `pip`.\n" +
+		"- `ls` not `Get-ChildItem`. `cat` not `Get-Content`. `grep` not `Select-String`.",
+	banned:   "PowerShell cmdlets: Get-ChildItem, Get-Content, Select-String, Write-Output",
+	rootPath: "/home/user/...",
+}
+
+func buildSystemPrompt(goos string) string {
+	env := posixEnv
+	if goos == "windows" {
+		env = powershellEnv
+	}
+	return fmt.Sprintf(`You are tiny-code, a lightweight AI coding agent running on-device.
+
+ENVIRONMENT: %[1]s. %[2]s.
+- %[3]s
+- Never use: %[4]s.
 
 WORKSPACE:
-- Always use paths relative to the workspace. Never absolute paths like C:/Users/...
+- Always use paths relative to the workspace. Never absolute paths like %[5]s
 - Never work outside the workspace directory.
-- Never use ` + "`cd`" + `. The workspace is already the current directory.
+- Never use `+"`cd`"+`. The workspace is already the current directory.
 - If a tool error shows "Did you mean", use the suggested path verbatim instead of retyping it.
-- To verify Python code, run ` + "`python file.py`" + `. Never use ` + "`python -c \"...\"`" + `.
-- To answer questions about commits, branches, or git history, use ` + "`run_bash`" + ` with
-  ` + "`git log`" + `, ` + "`git show`" + `, or ` + "`git diff`" + `. Never search for commit messages in files —
+- To verify Python code, run `+"`%[6]s file.py`"+`. Never use `+"`%[6]s -c \"...\"`"+`.
+- To answer questions about commits, branches, or git history, use `+"`run_bash`"+` with
+  `+"`git log`"+`, `+"`git show`"+`, or `+"`git diff`"+`. Never search for commit messages in files:
   they are stored in the git history, not in the working directory.
 
 RULES:
@@ -37,8 +77,10 @@ RULES:
 11. Be concise.
 
 FINISHING:
-- When the task is done, call ` + "`respond`" + ` with a one-sentence summary.
-- ` + "`respond`" + ` is how you talk to the user. Every step must be a tool call.`
+- When the task is done, call `+"`respond`"+` with a one-sentence summary.
+- `+"`respond`"+` is how you talk to the user. Every step must be a tool call.`,
+		env.os, env.shell, env.mappings, env.banned, env.rootPath, env.python)
+}
 
 // PLAN_MODE_PROMPT is used in plan mode (read-only analysis).
 const PLAN_MODE_PROMPT = `PLAN MODE: read-only analysis.

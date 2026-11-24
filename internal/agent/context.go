@@ -25,36 +25,21 @@ func countMessageTokens(m Message) int {
 	return countTokens(string(b))
 }
 
-// ContextManager tracks an approximate running token count and trims history
-// when it would exceed the budget.
+// ContextManager holds the token budget the conversation has to fit into.
 type ContextManager struct {
 	maxTokens int
 	reserve   int
-	estimated int
 }
 
 func newContextManager(maxTokens int) *ContextManager {
 	return &ContextManager{maxTokens: maxTokens, reserve: 4096}
 }
 
-func (c *ContextManager) push(m Message) {
-	c.estimated += countMessageTokens(m)
-}
-
-func (c *ContextManager) reset() {
-	c.estimated = 0
-}
-
-func (c *ContextManager) pushAll(msgs []Message) {
-	for _, m := range msgs {
-		c.push(m)
-	}
-}
-
 // trimMessages drops the oldest messages (after the system prompt) that no
-// longer fit, keeping a placeholder marker. It touches no shared
-// ContextManager state, so a side-question snapshot can trim its own copy
-// without racing the main loop.
+// longer fit, keeping a placeholder marker. The user's latest request always
+// survives together with everything that follows it. The function touches no
+// shared state, so a side-question snapshot can trim its own copy without
+// racing the main loop.
 func trimMessages(messages []Message, maxTokens, reserve int) []Message {
 	if len(messages) == 0 {
 		return messages
@@ -72,6 +57,15 @@ func trimMessages(messages []Message, maxTokens, reserve int) []Message {
 	system := messages[0]
 	rest := messages[1:]
 
+	// Dropping the request itself would leave the model without a task.
+	anchor := -1
+	for i := len(rest) - 1; i >= 0; i-- {
+		if rest[i].Role == "user" && !rest[i].Nudge {
+			anchor = i
+			break
+		}
+	}
+
 	marker := Message{Role: "system", Content: "[earlier context trimmed]"}
 	keptTotal := countMessageTokens(system) + countMessageTokens(marker)
 	var picked []Message
@@ -86,6 +80,10 @@ func trimMessages(messages []Message, maxTokens, reserve int) []Message {
 
 	dropped := len(rest) - len(picked)
 	reverseMessages(picked)
+	if anchor >= 0 && dropped > anchor {
+		dropped = anchor
+		picked = rest[anchor:]
+	}
 	picked = dropOrphanTools(picked)
 
 	kept := []Message{system}
