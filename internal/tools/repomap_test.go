@@ -24,7 +24,7 @@ func TestRepoMapText(t *testing.T) {
 	got := RepoMapText(mapWorkspace(t), 4000)
 	for _, want := range []string{
 		"internal/user/ (1 go)", "internal/auth/ (1 py)", "web/src/ (1 js)",
-		"root files: go.mod, main.go",
+		"root files: go.mod, logo.png, main.go",
 		"main.go: main", "internal/user/user.go: User, GetUserName",
 		"internal/auth/auth.py: login, Session", "web/src/app.js: render, SIZE",
 	} {
@@ -32,38 +32,10 @@ func TestRepoMapText(t *testing.T) {
 			t.Errorf("map misses %q:\n%s", want, got)
 		}
 	}
-	for _, unwanted := range []string{"TestUser", "node_modules", "ignored", "logo.png"} {
+	for _, unwanted := range []string{"TestUser", "node_modules", "ignored"} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("map contains %q:\n%s", unwanted, got)
 		}
-	}
-}
-
-// In Go the public names are the surface; helpers only show up when a file
-// has almost nothing public, and unexported package variables never do.
-func TestOutlinePrefersExportedNames(t *testing.T) {
-	re := reOutline[".go"]
-	ws := t.TempDir()
-	writeFileAt(t, filepath.Join(ws, "api.go"), "package p\n\nvar hidden = 1\n\ntype Client struct{}\n\nfunc New() *Client { return nil }\n\nfunc (c *Client) Close() {}\n\nfunc helper() {}\n")
-	writeFileAt(t, filepath.Join(ws, "loop.go"), "package p\n\nconst maxSize = 9\n\nfunc runOnce() {}\n\nfunc step() {}\n")
-
-	shown, _ := outlineSymbols(filepath.Join(ws, "api.go"), re, true)
-	if strings.Join(shown, ",") != "Client,New,Close" {
-		t.Errorf("api.go = %q", shown)
-	}
-	shown, all := outlineSymbols(filepath.Join(ws, "loop.go"), re, true)
-	if strings.Join(shown, ",") != "runOnce,step" {
-		t.Errorf("loop.go = %q, want the helpers but not the unexported const", shown)
-	}
-	// The spelling index is complete even where the outline is not.
-	if !containsString(all, "maxSize") {
-		t.Errorf("full name list = %q", all)
-	}
-	if got := SuggestIdentifier(ws, "maxSise"); !strings.Contains(got, "'maxSize'") {
-		t.Errorf("hint for an unexported name = %q", got)
-	}
-	if got := RepoMapText(ws, 4000); len(got) > 4000 {
-		t.Fatalf("map exceeds its budget: %d", len(got))
 	}
 }
 

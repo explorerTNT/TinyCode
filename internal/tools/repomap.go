@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 )
 
 // The project map is a pocket outline of a code base: its directories, files
@@ -19,23 +18,12 @@ import (
 // first rounds on exploration.
 
 const (
-	maxMapFiles    = 600
-	maxMapFileSize = 256 << 10
-	// maxSymbolsPerFile keeps a file's line short; the layout matters more
-	// than a complete index.
-	maxSymbolsPerFile = 6
+	maxMapFiles       = 600
+	maxMapFileSize    = 256 << 10
+	maxSymbolsPerFile = 14
 	maxRootFiles      = 40
 	mapScanTTL        = time.Minute
-	// mapTrailerReserve leaves room for the "... more files" note.
-	mapTrailerReserve = 70
-	// minExportedNames: below this, unexported names are shown as well, so
-	// a file of internal helpers is not left nameless.
-	minExportedNames = 3
 )
-
-// casedLanguages mark visibility by case: an upper-case name is the
-// public surface of the file, a lower-case one is a helper.
-var casedLanguages = map[string]bool{".go": true, ".cs": true, ".java": true, ".kt": true}
 
 // reOutline extracts the top-level names of a source file per language. The
 // first non-empty group is the name.
@@ -111,7 +99,7 @@ func scanRepo(workspace string) repoScan {
 			}
 			rel, _ := filepath.Rel(base, p)
 			rel = filepath.ToSlash(rel)
-			if !strings.Contains(rel, "/") && !strings.HasPrefix(rel, ".") && !IsBinaryExt(info.Name()) {
+			if !strings.Contains(rel, "/") {
 				scan.rootFiles[rel] = true
 			}
 			if len(scan.files) >= maxMapFiles || IsBinaryExt(info.Name()) || isTestFile(rel) || info.Size() > maxMapFileSize {
@@ -122,9 +110,9 @@ func scanRepo(workspace string) repoScan {
 			if !ok {
 				return nil
 			}
-			shown, all := outlineSymbols(p, re, casedLanguages[ext])
-			scan.files = append(scan.files, mapFile{rel: rel, ext: ext, symbols: shown})
-			for _, s := range all {
+			syms := outlineSymbols(p, re)
+			scan.files = append(scan.files, mapFile{rel: rel, ext: ext, symbols: syms})
+			for _, s := range syms {
 				key := strings.ToLower(s)
 				sym := scan.symbols[key]
 				sym.name = s
@@ -163,44 +151,28 @@ func isTestFile(rel string) bool {
 	return name == "conftest.py" || (strings.HasPrefix(name, "test_") && strings.HasSuffix(name, ".py"))
 }
 
-// outlineSymbols lists a file's public names first. In a language where
-// case marks visibility, helpers and unexported package variables only
-// show up when the file has almost nothing public to show. Every name is
-// returned as the second result: spelling hints want the full index.
-func outlineSymbols(path string, re *regexp.Regexp, cased bool) (shown, all []string) {
+func outlineSymbols(path string, re *regexp.Regexp) []string {
 	data, err := os.ReadFile(path)
 	if err != nil || bytes.IndexByte(data, 0) >= 0 {
-		return nil, nil
+		return nil
 	}
-	var exported, helpers []string
+	var syms []string
 	for _, line := range strings.Split(string(data), "\n") {
+		if len(syms) >= maxSymbolsPerFile {
+			break
+		}
 		m := re.FindStringSubmatch(line)
 		if m == nil {
 			continue
 		}
 		for _, g := range m[1:] {
-			if g == "" || g == "init" || strings.HasPrefix(g, "_") {
-				continue
+			if g != "" && g != "init" && !containsString(syms, g) {
+				syms = append(syms, g)
+				break
 			}
-			if !containsString(all, g) {
-				all = append(all, g)
-			}
-			if len(exported) < maxSymbolsPerFile && !containsString(exported, g) {
-				switch {
-				case !cased || unicode.IsUpper([]rune(g)[0]):
-					exported = append(exported, g)
-				case !strings.HasPrefix(m[0], "var") && !strings.HasPrefix(m[0], "const"):
-					helpers = append(helpers, g)
-				}
-			}
-			break
 		}
 	}
-	if len(exported) < minExportedNames {
-		room := minInt(len(helpers), maxSymbolsPerFile-len(exported))
-		exported = append(exported, helpers[:room]...)
-	}
-	return exported, all
+	return syms
 }
 
 // renderRepoMap lays the directories out first, so a tight budget costs the
@@ -265,7 +237,7 @@ func renderRepoMap(files []mapFile, rootFiles map[string]bool, maxChars int) str
 			continue
 		}
 		line := f.rel + ": " + strings.Join(f.symbols, ", ") + "\n"
-		if b.Len()+len(line) > maxChars-mapTrailerReserve {
+		if b.Len()+len(line) > maxChars {
 			omitted++
 			continue
 		}

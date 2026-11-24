@@ -35,7 +35,9 @@ const (
 
 // TurnResult summarises the last processTurn call.
 type TurnResult struct {
-	Outcome    string
+	Outcome string
+	// Answer is what the model said to the user when the turn ended.
+	Answer     string
 	Rounds     int
 	ToolCalls  int
 	ToolErrors int
@@ -188,6 +190,7 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 						a.io.Println("")
 					}
 					res.Outcome = OutcomeRespond
+					res.Answer = answer
 					return
 				}
 
@@ -287,12 +290,14 @@ func (a *Agent) processTurn(maxRounds int, silent bool) {
 
 			if looksDone(cleanContent) {
 				res.Outcome = OutcomeDone
+				res.Answer = cleanContent
 				a.io.Println("")
 				return
 			}
 
 			if didWork && textOnlyRounds >= 1 {
 				res.Outcome = OutcomeDone
+				res.Answer = cleanContent
 				a.io.Println(i18n.T("agent.text_twice"))
 				return
 			}
@@ -529,12 +534,9 @@ func (a *Agent) handlePlanApproval() {
 	switch resp {
 	case "y":
 		plan := a.lastPlan
-		a.clearMessages()
-		a.addMsg(Message{Role: "system", Content: a.systemPrompt()})
-		a.addMsg(Message{Role: "user", Content: "Execute this plan step by step:\n\n" + plan + "\n\nWork through each step. Read files before editing. Show progress as you go."})
 		a.planMode = false
 		a.io.Println("")
-		a.processTurn(0, false)
+		a.runPlanSteps(plan)
 		a.io.Println("")
 	case "edit":
 		a.io.Println(i18n.T("plan.edit"))
