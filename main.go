@@ -9,6 +9,7 @@ import (
 
 	"github.com/explorerTNT/TinyCode/internal/agent"
 	"github.com/explorerTNT/TinyCode/internal/config"
+	"github.com/explorerTNT/TinyCode/internal/doctor"
 	"github.com/explorerTNT/TinyCode/internal/i18n"
 	"github.com/explorerTNT/TinyCode/internal/tui"
 	"github.com/explorerTNT/TinyCode/internal/updater"
@@ -28,6 +29,7 @@ func main() {
 		showVersion = flag.Bool("version", false, "print version and exit")
 		doUpdate    = flag.Bool("update", false, "check for updates and install if available")
 		noUpdate    = flag.Bool("no-update", false, "skip update check on startup")
+		doctorCheck = flag.Bool("doctor", false, "check the model server and exit")
 	)
 	flag.Parse()
 
@@ -46,6 +48,11 @@ func main() {
 		cfg.Language = *lang
 	}
 	i18n.Set(i18n.Parse(cfg.Language))
+
+	// --- doctor mode ---
+	if *doctorCheck {
+		os.Exit(runDoctor(cfg))
+	}
 
 	// --- update mode ---
 	if *doUpdate {
@@ -123,6 +130,19 @@ func checkUpdate() {
 		return
 	}
 	fmt.Fprintf(os.Stderr, i18n.T("update.available")+"\n", release.Tag, version)
+}
+
+// runDoctor checks the model server and returns the process exit code:
+// 1 when something keeps the agent from working.
+func runDoctor(cfg *config.Config) int {
+	report := doctor.Run(cfg)
+	for _, line := range report.Lines {
+		fmt.Println(line)
+	}
+	if report.Problems > 0 {
+		return 1
+	}
+	return 0
 }
 
 func runUpdate() {
