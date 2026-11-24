@@ -25,5 +25,8 @@ func setKillTree(cmd *exec.Cmd) {
 	cmd.WaitDelay = 3 * time.Second
 }
 
+// hideConsole is a no-op: there is no console window to hide.
+func hideConsole(*exec.Cmd) {}
+
 // systemEncoding is nil: POSIX tools are assumed to write UTF-8.
 func systemEncoding() encoding.Encoding { return nil }

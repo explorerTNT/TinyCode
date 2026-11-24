@@ -30,5 +30,5 @@ func WriteFile(workspace, path, content string) string {
 	if err := writeText(filepathAbs, content, enc); err != nil {
 		return fmt.Sprintf("Error writing file: %v", err)
 	}
-	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(content), path)
+	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(content), path) + SyntaxCheck(filepathAbs)
 }

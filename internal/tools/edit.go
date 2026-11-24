@@ -52,7 +52,7 @@ func writeEdit(filepathAbs, shownPath, oldContent, newContent string, enc textEn
 		sign = ""
 	}
 	msg := fmt.Sprintf("Successfully edited %s (%s%d bytes, %s)", shownPath, sign, diff, detail)
-	return msg
+	return msg + SyntaxCheck(filepathAbs)
 }
 
 // matchNewlines re-encodes text with the file's newline style.

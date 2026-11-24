@@ -32,6 +32,12 @@ func setKillTree(cmd *exec.Cmd) {
 	cmd.WaitDelay = 3 * time.Second
 }
 
+// hideConsole keeps a short-lived helper such as gofmt from flashing a
+// console window.
+func hideConsole(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+}
+
 // systemEncoding is the ANSI code page, in which native tools such as
 // Python write their redirected output.
 func systemEncoding() encoding.Encoding {

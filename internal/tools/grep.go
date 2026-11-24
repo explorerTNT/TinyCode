@@ -52,9 +52,17 @@ func SearchFiles(workspace, pattern, path, include string) string {
 	}
 
 	if out := tryRg(pattern, workspace, searchPath, include); out != "" {
-		return out
+		return suggestOnMiss(workspace, pattern, out)
 	}
-	return fallbackGrep(pattern, searchPath, include)
+	return suggestOnMiss(workspace, pattern, fallbackGrep(pattern, searchPath, include))
+}
+
+// suggestOnMiss adds a spelling hint to a search that found nothing.
+func suggestOnMiss(workspace, pattern, out string) string {
+	if strings.HasPrefix(out, "No matches") {
+		return out + SuggestIdentifier(workspace, pattern)
+	}
+	return out
 }
 
 func grepSingleFile(pattern, filepathAbs string) string {
