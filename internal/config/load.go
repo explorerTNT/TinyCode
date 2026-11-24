@@ -8,10 +8,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 )
 
 // Default returns the configuration with default values.
-// Workspace is intentionally left empty — it defaults to the current working
+// Workspace is intentionally left empty: it defaults to the current working
 // directory at runtime and is never persisted to the config file.
 func Default() *Config {
 	return &Config{
@@ -28,6 +29,7 @@ func Default() *Config {
 			MaxToolRounds:     50,
 			PlanTokens:        1536,
 			BtwMaxTokens:      1024,
+			StallTimeout:      120,
 			Temperature:       0.6,
 			ActionTemperature: 0.1,
 			PermissionMode:    "ask",
@@ -35,39 +37,101 @@ func Default() *Config {
 	}
 }
 
-// Load returns the configuration from the config file (creating it with default
-// values if it does not exist), then overlays non-empty environment variables
-// on top of the loaded values.
+// Load returns the configuration from the config file (creating it with
+// default values if it does not exist), then overlays non-empty environment
+// variables on top. Fields missing from the file keep their defaults, so a
+// config written by an older version stays usable.
 func Load() (*Config, error) {
 	path, err := ConfigPath()
 	if err != nil {
 		return nil, err
 	}
 
-	var cfg *Config
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		cfg = Default()
+	cfg := Default()
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
 		if err := cfg.Save(); err != nil {
 			return nil, err
 		}
-	} else if err != nil {
-		return nil, fmt.Errorf("stat config %s: %w", path, err)
-	} else {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read config %s: %w", path, err)
-		}
-
-		cfg = &Config{}
+	case err != nil:
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	default:
 		if err := json.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config %s: %w", path, err)
 		}
+		if cfg.LM == nil {
+			cfg.LM = Default().LM
+		}
+		if cfg.TN == nil {
+			cfg.TN = Default().TN
+		}
 	}
+
+	// The workspace is resolved at runtime from the flag, the environment or
+	// the current directory, never from the file.
+	cfg.TN.Workspace = ""
 
 	if err := applyEnv(cfg); err != nil {
 		return nil, err
 	}
+	cfg.normalize()
 	return cfg, nil
+}
+
+// normalize replaces values that would break the agent (missing, empty or
+// non-positive) with defaults.
+func (c *Config) normalize() {
+	def := Default()
+	if c.Language == "" {
+		c.Language = def.Language
+	}
+	if c.LM.Host == "" {
+		c.LM.Host = def.LM.Host
+	}
+	if c.LM.Port <= 0 || c.LM.Port > 65535 {
+		c.LM.Port = def.LM.Port
+	}
+	if c.LM.Name == "" {
+		c.LM.Name = def.LM.Name
+	}
+	tn, dt := c.TN, def.TN
+	for _, f := range []struct {
+		dst *int
+		def int
+	}{
+		{&tn.MaxTokens, dt.MaxTokens},
+		{&tn.ServerContext, dt.ServerContext},
+		{&tn.ContextLimit, dt.ContextLimit},
+		{&tn.MaxToolRounds, dt.MaxToolRounds},
+		{&tn.PlanTokens, dt.PlanTokens},
+		{&tn.BtwMaxTokens, dt.BtwMaxTokens},
+	} {
+		if *f.dst <= 0 {
+			*f.dst = f.def
+		}
+	}
+	// A zero stall timeout means "disabled"; anything below makes no sense.
+	if tn.StallTimeout < 0 {
+		tn.StallTimeout = dt.StallTimeout
+	}
+	for _, f := range []struct {
+		dst *float64
+		def float64
+	}{
+		{&tn.Temperature, dt.Temperature},
+		{&tn.ActionTemperature, dt.ActionTemperature},
+	} {
+		if *f.dst < 0 || *f.dst > 2 {
+			*f.dst = f.def
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(tn.PermissionMode)) {
+	case "auto", "ask", "deny":
+		tn.PermissionMode = strings.ToLower(strings.TrimSpace(tn.PermissionMode))
+	default:
+		tn.PermissionMode = dt.PermissionMode
+	}
 }
 
 // applyEnv walks the config struct and overrides each field tagged with `env:`
@@ -100,21 +164,6 @@ func applyEnvValue(v reflect.Value) error {
 			continue
 		}
 		if field.Kind() == reflect.Pointer && field.Type().Elem().Kind() == reflect.Struct {
-			if field.IsNil() {
-				newPtr := reflect.New(field.Type().Elem())
-				def := Default()
-				switch field.Type().Elem().Name() {
-				case "LMConfig":
-					if def.LM != nil {
-						newPtr.Elem().Set(reflect.ValueOf(*def.LM))
-					}
-				case "TNConfig":
-					if def.TN != nil {
-						newPtr.Elem().Set(reflect.ValueOf(*def.TN))
-					}
-				}
-				field.Set(newPtr)
-			}
 			if err := applyEnvValue(field); err != nil {
 				return err
 			}
@@ -161,7 +210,7 @@ func setField(field reflect.Value, raw string) error {
 }
 
 // Save writes the configuration to the config file, creating directories as
-// needed. Workspace is never persisted — it is always resolved at runtime from
+// needed. Workspace is never persisted: it is always resolved at runtime from
 // the current directory, CLI flags, or environment variables.
 func (c *Config) Save() error {
 	path, err := ConfigPath()
