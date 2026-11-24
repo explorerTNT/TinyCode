@@ -29,6 +29,8 @@ const (
 	writeToolsFile      = "write_file"
 	editToolsFile       = "edit_file"
 	runBashTool         = "run_bash"
+	webSearchTool       = "web_search"
+	webFetchTool        = "web_fetch"
 )
 
 var criticBashDangerous = []*regexp.Regexp{
@@ -103,7 +105,7 @@ func New(cfg *config.Config, io IO) (*Agent, error) {
 		workspace: workspace,
 	}
 
-	a.permissions = permissions.New(permissions.ParseMode(cfg.TN.PermissionMode), io.Input)
+	a.permissions = permissions.New(permissions.ParseMode(cfg.TN.PermissionMode), workspace, io.Input)
 	a.tools = tools.BuildTools(workspace, ask, note)
 	a.toolMap = make(map[string]*tools.Tool, len(a.tools))
 	for _, t := range a.tools {
@@ -411,6 +413,16 @@ func (a *Agent) executeTool(name string, args map[string]any) string {
 	if name == writeToolsFile || name == editToolsFile {
 		if !a.permissions.CheckWrite(strArg(args, "path")) {
 			return "Error: Write rejected by user"
+		}
+	}
+
+	if name == webSearchTool || name == webFetchTool {
+		target := strArg(args, "url")
+		if name == webSearchTool {
+			target = strArg(args, "query")
+		}
+		if !a.permissions.CheckWeb(target) {
+			return "Error: Web request rejected by user"
 		}
 	}
 

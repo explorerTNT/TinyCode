@@ -1,11 +1,9 @@
 package permissions
 
 import (
-	"slices"
 	"strings"
 
 	"github.com/explorerTNT/TinyCode/internal/i18n"
-	"github.com/explorerTNT/TinyCode/internal/tools"
 )
 
 // Mode is the permission enforcement policy.
@@ -15,11 +13,6 @@ const (
 	ModeAuto Mode = iota + 1
 	ModeDeny
 	ModeAsk
-)
-
-const (
-	dangerousChars     = "><|;&`\n\r"
-	dangerousSubString = "$("
 )
 
 // ParseMode maps a config string ("auto", "ask", "deny") to a Mode.
@@ -51,28 +44,24 @@ func (m Mode) String() string {
 // which is treated as a rejection.
 type InputFunc func(prompt string) (string, error)
 
-// Service enforces write and shell permissions, prompting the user in "ask"
-// mode through the injected InputFunc.
+// Service enforces write, shell and web permissions, prompting the user in
+// "ask" mode through the injected InputFunc.
 type Service struct {
-	mode                        Mode
-	autoApproveReadOnlyCommands bool
-	input                       InputFunc
+	mode      Mode
+	workspace string
+	input     InputFunc
 }
 
-// New builds a Service. mode==0 means ModeAsk. A nil input falls back to a
-// stdin reader.
-func New(mode Mode, input InputFunc) *Service {
+// New builds a Service bound to a workspace. mode==0 means ModeAsk. A nil
+// input falls back to a stdin reader.
+func New(mode Mode, workspace string, input InputFunc) *Service {
 	if mode == 0 {
 		mode = ModeAsk
 	}
 	if input == nil {
 		input = defaultInput
 	}
-	return &Service{
-		mode:                        mode,
-		autoApproveReadOnlyCommands: true,
-		input:                       input,
-	}
+	return &Service{mode: mode, workspace: workspace, input: input}
 }
 
 // SetInput swaps the input source at runtime (used to rewire the console
@@ -84,7 +73,8 @@ func (s *Service) SetInput(input InputFunc) {
 // Mode returns the current enforcement policy.
 func (s *Service) Mode() Mode { return s.mode }
 
-// CheckBash decides whether a shell command may run.
+// CheckBash decides whether a shell command may run. In ask mode a command
+// that the read-only policy recognises in full is approved without a prompt.
 func (s *Service) CheckBash(command string) bool {
 	switch s.mode {
 	case ModeAuto:
@@ -92,13 +82,9 @@ func (s *Service) CheckBash(command string) bool {
 	case ModeDeny:
 		return false
 	}
-
-	stripped := strings.ToLower(strings.TrimSpace(command))
-
-	if s.autoApproveReadOnlyCommands && isCommandReadOnly(stripped) {
+	if isCommandReadOnly(s.workspace, strings.ToLower(strings.TrimSpace(command))) {
 		return true
 	}
-
 	return s.askUser(i18n.T("perm.run", command))
 }
 
@@ -111,6 +97,18 @@ func (s *Service) CheckWrite(path string) bool {
 		return false
 	}
 	return s.askUser(i18n.T("perm.write", path))
+}
+
+// CheckWeb decides whether a web request to the given query or URL may
+// leave the machine.
+func (s *Service) CheckWeb(target string) bool {
+	switch s.mode {
+	case ModeAuto:
+		return true
+	case ModeDeny:
+		return false
+	}
+	return s.askUser(i18n.T("perm.web", target))
 }
 
 // askUser prompts the user and interprets the reply. "a" switches the service
@@ -127,26 +125,4 @@ func (s *Service) askUser(prompt string) bool {
 		return true
 	}
 	return resp == "y" || resp == "yes"
-}
-
-func containsDangerous(s string) bool {
-	return strings.Contains(s, dangerousSubString) || strings.ContainsAny(s, dangerousChars)
-}
-
-func isCommandReadOnly(command string) bool {
-	if containsDangerous(command) {
-		return false
-	}
-
-	elems := strings.Fields(command)
-	if len(elems) == 0 {
-		return false
-	}
-	if len(elems) <= 2 && slices.Contains(tools.ReadOnlySingleCommands, elems[0]) {
-		return true
-	}
-	if len(elems) >= 2 && slices.Contains(tools.ReadOnlyPairsCommands, [2]string{elems[0], elems[1]}) {
-		return true
-	}
-	return false
 }
