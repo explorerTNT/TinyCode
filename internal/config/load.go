@@ -30,6 +30,7 @@ func Default() *Config {
 			PlanTokens:        1536,
 			BtwMaxTokens:      1024,
 			StallTimeout:      120,
+			RepoMapChars:      4000,
 			Temperature:       0.6,
 			ActionTemperature: 0.1,
 			PermissionMode:    "ask",
@@ -114,6 +115,10 @@ func (c *Config) normalize() {
 	// A zero stall timeout means "disabled"; anything below makes no sense.
 	if tn.StallTimeout < 0 {
 		tn.StallTimeout = dt.StallTimeout
+	}
+	// A zero map size means "no map".
+	if tn.RepoMapChars < 0 {
+		tn.RepoMapChars = dt.RepoMapChars
 	}
 	for _, f := range []struct {
 		dst *float64
@@ -203,6 +208,12 @@ func setField(field reflect.Value, raw string) error {
 			return err
 		}
 		field.SetFloat(f)
+	case reflect.Bool:
+		on, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("%w (use true or false)", err)
+		}
+		field.SetBool(on)
 	default:
 		return fmt.Errorf("unsupported type %s", field.Kind())
 	}

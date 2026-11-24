@@ -20,11 +20,16 @@ type TNConfig struct {
 	BtwMaxTokens  int `json:"btw_max_tokens"     env:"TINYCODE_BTW_MAX_TOKENS"`
 	// Seconds without any data from the model server before a stream is
 	// cancelled as stalled; 0 disables the watchdog.
-	StallTimeout      int     `json:"stall_timeout"      env:"TINYCODE_STALL_TIMEOUT"`
-	Temperature       float64 `json:"temperature"        env:"TINYCODE_TEMPERATURE"`
-	ActionTemperature float64 `json:"action_temperature" env:"TINYCODE_ACTION_TEMPERATURE"`
-	PermissionMode    string  `json:"permission_mode"    env:"TINYCODE_PERMISSION_MODE"`
-	Workspace         string  `json:"workspace"          env:"TINYCODE_WORKSPACE"`
+	StallTimeout int `json:"stall_timeout" env:"TINYCODE_STALL_TIMEOUT"`
+	// Characters of the project map (directories, files, symbols) put into
+	// the system prompt; 0 disables the map.
+	RepoMapChars int `json:"repo_map_chars" env:"TINYCODE_REPO_MAP_CHARS"`
+	// DisableSyntaxCheck turns off the parser run after every edit.
+	DisableSyntaxCheck bool    `json:"disable_syntax_check" env:"TINYCODE_DISABLE_SYNTAX_CHECK"`
+	Temperature        float64 `json:"temperature"        env:"TINYCODE_TEMPERATURE"`
+	ActionTemperature  float64 `json:"action_temperature" env:"TINYCODE_ACTION_TEMPERATURE"`
+	PermissionMode     string  `json:"permission_mode"    env:"TINYCODE_PERMISSION_MODE"`
+	Workspace          string  `json:"workspace"          env:"TINYCODE_WORKSPACE"`
 }
 
 type Config struct {

@@ -78,6 +78,7 @@ type Agent struct {
 	client      *openai.Client
 	io          IO
 	workspace   string
+	brief       brief
 
 	tools       []*tools.Tool
 	toolMap     map[string]*tools.Tool
@@ -132,6 +133,8 @@ func New(cfg *config.Config, io IO) (*Agent, error) {
 	}
 
 	a.permissions = permissions.New(permissions.ParseMode(cfg.TN.PermissionMode), workspace, io.Input)
+	a.brief = loadBrief(workspace, cfg.TN.RepoMapChars)
+	tools.SyntaxCheckEnabled = !cfg.TN.DisableSyntaxCheck
 	a.tools = tools.BuildTools(workspace, ask, note)
 	a.toolMap = make(map[string]*tools.Tool, len(a.tools))
 	for _, t := range a.tools {

@@ -528,7 +528,7 @@ func (a *Agent) handlePlanApproval() {
 	case "y":
 		plan := a.lastPlan
 		a.clearMessages()
-		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
+		a.addMsg(Message{Role: "system", Content: a.systemPrompt()})
 		a.addMsg(Message{Role: "user", Content: "Execute this plan step by step:\n\n" + plan + "\n\nWork through each step. Read files before editing. Show progress as you go."})
 		a.planMode = false
 		a.io.Println("")
@@ -573,7 +573,7 @@ func (a *Agent) compactMessages() {
 	}
 
 	a.clearMessages()
-	a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
+	a.addMsg(Message{Role: "system", Content: a.systemPrompt()})
 	a.addMsg(Message{Role: "user", Content: "Summary of the previous conversation:\n" + summary})
 	a.io.Println(i18n.T("compact.done"))
 }
@@ -698,7 +698,7 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 
 	case c == "/clear":
 		a.clearMessages()
-		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
+		a.addMsg(Message{Role: "system", Content: a.systemPrompt()})
 		a.planMode = false
 		a.lastPlan = ""
 		a.io.Println(i18n.T("session.cleared"))
@@ -707,7 +707,7 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 	case c == "/new":
 		_, _ = a.sessions.save(fmt.Sprintf("session_%d", time.Now().Unix()), a.messages, a.planMode, a.config.LM.Name, a.workspace)
 		a.clearMessages()
-		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
+		a.addMsg(Message{Role: "system", Content: a.systemPrompt()})
 		a.planMode = false
 		a.lastPlan = ""
 		a.io.Println(i18n.T("session.new"))
@@ -717,7 +717,7 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 		a.planMode = true
 		desc := strings.TrimSpace(strings.TrimPrefix(c, "/plan"))
 		a.clearMessages()
-		a.addMsg(Message{Role: "system", Content: PLAN_MODE_PROMPT})
+		a.addMsg(Message{Role: "system", Content: a.planPrompt()})
 		if desc != "" {
 			a.addMsg(Message{Role: "user", Content: desc})
 		}
@@ -754,9 +754,7 @@ func (a *Agent) handleCommand(cmd string) (bool, bool) {
 
 // Run starts the interactive session loop.
 func (a *Agent) Run() {
-	if len(a.messages) == 0 {
-		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
-	}
+	a.refreshBrief()
 
 	a.io.Println(i18n.T("agent.banner_model", a.config.LM.Name))
 	a.io.Println(i18n.T("agent.banner_workspace", a.workspace))
@@ -800,6 +798,7 @@ func (a *Agent) Run() {
 			continue
 		}
 
+		a.refreshBrief()
 		if a.planMode {
 			a.addMsg(Message{Role: "user", Content: userInput})
 			a.processPlanTurn()
@@ -815,9 +814,7 @@ func (a *Agent) Run() {
 
 // RunOnce runs a single prompt non-interactively.
 func (a *Agent) RunOnce(prompt string) {
-	if len(a.messages) == 0 {
-		a.addMsg(Message{Role: "system", Content: SYSTEM_PROMPT})
-	}
+	a.refreshBrief()
 	a.addMsg(Message{Role: "user", Content: prompt})
 	a.io.Println("")
 	a.processTurn(0, false)
