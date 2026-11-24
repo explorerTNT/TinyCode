@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"regexp"
@@ -9,45 +8,51 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/pmezard/go-difflib/difflib"
-	"golang.org/x/text/encoding/charmap"
 
 	"github.com/explorerTNT/TinyCode/internal/i18n"
 )
 
 var (
-	utf8BOM  = []byte{0xEF, 0xBB, 0xBF}
 	reDeclRe = regexp.MustCompile(`^(?:class|def|async\s+def)\s+\w`)
 	reDeclP  = regexp.MustCompile(`^\s*((?:async\s+def|def|class)\s+\w+)`)
 )
 
-// readText reads a text file, decoding BOM/UTF-8/Windows-1251 and reporting
-// whether a UTF-8 BOM was present so it can be written back.
-func readText(filepathAbs string) (string, bool, error) {
+// readText reads a text file in its own encoding so that an edit can write
+// it back the same way.
+func readText(filepathAbs string) (string, textEncoding, error) {
 	b, err := os.ReadFile(filepathAbs)
 	if err != nil {
-		return "", false, err
+		return "", encUTF8, err
 	}
-	if bytes.HasPrefix(b, utf8BOM) {
-		return string(b[len(utf8BOM):]), true, nil
-	}
-	if utf8.Valid(b) {
-		return string(b), false, nil
-	}
-	if dec, err := charmap.Windows1251.NewDecoder().Bytes(b); err == nil {
-		return string(dec), false, nil
-	}
-	return strings.ToValidUTF8(string(b), "\uFFFD"), false, nil
+	content, enc := decodeText(b)
+	return content, enc, nil
 }
 
-func writeText(filepathAbs, content string, hadBOM bool) error {
-	data := []byte(content)
-	if hadBOM {
-		data = append(append([]byte{}, utf8BOM...), data...)
+// writeText saves content in the encoding the file was read with. Text the
+// encoding cannot store is refused rather than silently converted or
+// corrupted.
+func writeText(filepathAbs, content string, enc textEncoding) error {
+	data, err := encodeText(content, enc)
+	if err != nil {
+		return errUnencodable(enc, err)
 	}
 	return os.WriteFile(filepathAbs, data, 0o644)
+}
+
+// writeEdit saves edited content and formats the tool result.
+func writeEdit(filepathAbs, shownPath, oldContent, newContent string, enc textEncoding, detail string) string {
+	if err := writeText(filepathAbs, newContent, enc); err != nil {
+		return fmt.Sprintf("Error editing file: %v", err)
+	}
+	diff := len(newContent) - len(oldContent)
+	sign := "+"
+	if diff < 0 {
+		sign = ""
+	}
+	msg := fmt.Sprintf("Successfully edited %s (%s%d bytes, %s)", shownPath, sign, diff, detail)
+	return msg
 }
 
 // matchNewlines re-encodes text with the file's newline style.
@@ -78,7 +83,7 @@ func runeSeq(s string) []string {
 	return out
 }
 
-func replaceLines(filepathAbs, content, shownPath string, hadBOM bool, start, end int, newText string) string {
+func replaceLines(filepathAbs, content, shownPath string, enc textEncoding, start, end int, newText string) string {
 	newline := "\n"
 	if strings.Contains(content, "\r\n") {
 		newline = "\r\n"
@@ -119,17 +124,8 @@ func replaceLines(filepathAbs, content, shownPath string, hadBOM bool, start, en
 		out += newline
 	}
 
-	if err := writeText(filepathAbs, out, hadBOM); err != nil {
-		return fmt.Sprintf("Error editing file: %v", err)
-	}
-
-	diff := len(out) - len(content)
-	sign := "+"
-	if diff < 0 {
-		sign = ""
-	}
-	return fmt.Sprintf("Successfully edited %s (%s%d bytes, lines %d-%d replaced: %d -> %d)",
-		shownPath, sign, diff, start, end, len(replaced), len(newLines))
+	return writeEdit(filepathAbs, shownPath, content, out, enc,
+		fmt.Sprintf("lines %d-%d replaced: %d -> %d", start, end, len(replaced), len(newLines)))
 }
 
 // locateBlock finds the byte span in content that probe was meant to match.
@@ -297,20 +293,12 @@ func nearMiss(content, oldString string, maxHits int) string {
 	var out []string
 	for i := 0; i < len(ranked) && i < maxHits; i++ {
 		ln := ranked[i].ln
-		out = append(out, fmt.Sprintf("  line %d: %s", ln, truncate(lines[ln-1], 120)))
+		out = append(out, fmt.Sprintf("  line %d: %s", ln, truncateRunes(lines[ln-1], 120)))
 	}
 	if len(ranked) > maxHits {
 		out = append(out, fmt.Sprintf("  ... and %d more", len(ranked)-maxHits))
 	}
 	return strings.Join(out, "\n")
-}
-
-func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
 }
 
 // asLineNumber coerces a line number sent as text/float. ok=false when unusable.
@@ -368,6 +356,9 @@ func isBlankLineArg(v any) bool {
 // EditFile replaces text in a file, preferring start_line/end_line.
 func EditFile(workspace, path string, oldString, newString string, rawStart, rawEnd any) string {
 	filepathAbs := resolveUnder(workspace, path)
+	if filepathAbs == "" {
+		return outsideWorkspaceError(path)
+	}
 	info, err := os.Stat(filepathAbs)
 	if os.IsNotExist(err) {
 		return fmt.Sprintf("Error: File not found: %s", path)
@@ -388,7 +379,7 @@ func EditFile(workspace, path string, oldString, newString string, rawStart, raw
 		return fmt.Sprintf("Error: end_line must be a line number, got %v. Use the numbers printed by read_file.", rawEnd)
 	}
 
-	content, hadBOM, err := readText(filepathAbs)
+	content, enc, err := readText(filepathAbs)
 	if err != nil {
 		return fmt.Sprintf("Error editing file: %v", err)
 	}
@@ -400,12 +391,14 @@ func EditFile(workspace, path string, oldString, newString string, rawStart, raw
 		if endLine == 0 {
 			endLine = startLine
 		}
-		return replaceLines(filepathAbs, content, path, hadBOM, startLine, endLine, newString)
+		return replaceLines(filepathAbs, content, path, enc, startLine, endLine, newString)
 	}
 
 	if oldString == "" {
 		return "Error: provide either start_line (preferred, from read_file) or old_string."
 	}
+
+	changed := fmt.Sprintf("%d lines changed", strings.Count(oldString, "\n")+1)
 
 	crlf := strings.Contains(content, "\r\n")
 	if crlf && !strings.Contains(oldString, "\r\n") {
@@ -413,38 +406,19 @@ func EditFile(workspace, path string, oldString, newString string, rawStart, raw
 		if strings.Count(contentCmp, oldString) == 1 {
 			newLF := strings.ReplaceAll(strings.ReplaceAll(newString, "\r\n", "\n"), "\r", "\n")
 			newCmp := strings.Replace(contentCmp, oldString, newLF, 1)
-			newContent := strings.ReplaceAll(newCmp, "\n", "\r\n")
-			if err := writeText(filepathAbs, newContent, hadBOM); err != nil {
-				return fmt.Sprintf("Error editing file: %v", err)
-			}
-			diff := len(newContent) - len(content)
-			sign := "+"
-			if diff < 0 {
-				sign = ""
-			}
-			return fmt.Sprintf("Successfully edited %s (%s%d bytes, %d lines changed)",
-				path, sign, diff, strings.Count(oldString, "\n")+1)
+			return writeEdit(filepathAbs, path, content, strings.ReplaceAll(newCmp, "\n", "\r\n"), enc, changed)
 		}
 	}
 
 	count := strings.Count(content, oldString)
 	if count == 0 {
-		start, end, note, ok := locateBlock(content, oldString)
+		start, end, matchNote, ok := locateBlock(content, oldString)
 		if ok {
 			newContent := content[:start] + matchNewlines(newString, content) + content[end:]
-			if err := writeText(filepathAbs, newContent, hadBOM); err != nil {
-				return fmt.Sprintf("Error editing file: %v", err)
-			}
-			diff := len(newContent) - len(content)
-			sign := "+"
-			if diff < 0 {
-				sign = ""
-			}
-			return fmt.Sprintf("Successfully edited %s (%s%d bytes, %d lines changed)%s",
-				path, sign, diff, strings.Count(oldString, "\n")+1, note)
+			return writeEdit(filepathAbs, path, content, newContent, enc, changed+matchNote)
 		}
 
-		short := strings.ReplaceAll(truncate(oldString, 50), "\n", "\\n")
+		short := strings.ReplaceAll(truncateRunes(strings.TrimSpace(oldString), 50), "\n", "\\n")
 		hint := nearMiss(content, oldString, 3)
 		msg := fmt.Sprintf("Error: Could not find '%s...' in %s", short, path)
 		if hint != "" {
@@ -456,7 +430,7 @@ func EditFile(workspace, path string, oldString, newString string, rawStart, raw
 		return msg
 	}
 	if count > 1 {
-		short := strings.ReplaceAll(truncate(oldString, 50), "\n", "\\n")
+		short := strings.ReplaceAll(truncateRunes(strings.TrimSpace(oldString), 50), "\n", "\\n")
 		return fmt.Sprintf("Error: Found %d occurrences of '%s...' in %s. Provide more surrounding context to make old_string unique.",
 			count, short, path)
 	}
@@ -465,16 +439,7 @@ func EditFile(workspace, path string, oldString, newString string, rawStart, raw
 	if newContent == content {
 		return "No changes made: old_string and new_string are identical. To fix a typo, new_string must differ from old_string."
 	}
-	if err := writeText(filepathAbs, newContent, hadBOM); err != nil {
-		return fmt.Sprintf("Error editing file: %v", err)
-	}
-	diff := len(newContent) - len(content)
-	sign := "+"
-	if diff < 0 {
-		sign = ""
-	}
-	return fmt.Sprintf("Successfully edited %s (%s%d bytes, %d lines changed)",
-		path, sign, diff, strings.Count(oldString, "\n")+1)
+	return writeEdit(filepathAbs, path, content, newContent, enc, changed)
 }
 
 // note is wired by the registry to the agent's reporter; edit_file uses it for

@@ -64,6 +64,9 @@ func strArg(args map[string]any, key string) string {
 	}
 }
 
+// StrArg is the exported strArg, for packages that build on the tools.
+func StrArg(args map[string]any, key string) string { return strArg(args, key) }
+
 // intArg extracts an integer argument with a default fallback.
 func intArg(args map[string]any, key string, def int) int {
 	v, ok := args[key]

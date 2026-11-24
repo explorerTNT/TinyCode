@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -20,17 +22,6 @@ var EXCLUDE_DIRS = map[string]bool{
 	".cache": true, ".parcel-cache": true, "coverage": true, ".nuget": true,
 }
 
-// NOISE_EXTS are file extensions treated as build/binary noise.
-var NOISE_EXTS = map[string]bool{
-	".exe": true, ".dll": true, ".pdb": true, ".obj": true, ".lib": true,
-	".so": true, ".dylib": true, ".class": true, ".pyc": true, ".pyd": true,
-	".rar": true, ".zip": true, ".7z": true, ".gz": true, ".tar": true,
-	".nupkg": true, ".ico": true, ".png": true, ".jpg": true, ".jpeg": true,
-	".gif": true, ".bmp": true, ".webp": true, ".mp3": true, ".mp4": true,
-	".avi": true, ".mkv": true, ".wav": true, ".ttf": true, ".otf": true,
-	".woff": true, ".woff2": true,
-}
-
 const (
 	maxFiles     = 20000
 	scanTimeout  = 10 * time.Second
@@ -41,7 +32,7 @@ const (
 func ListFiles(workspace, pattern, path string) string {
 	base := resolveUnder(workspace, path)
 	if base == "" {
-		return fmt.Sprintf("Error: Path not found: %s", path)
+		return outsideWorkspaceError(path)
 	}
 	info, err := os.Stat(base)
 	if err != nil || !info.IsDir() {
@@ -60,17 +51,24 @@ func ListFiles(workspace, pattern, path string) string {
 	if strings.ContainsAny(pattern, "*?") {
 		limit = 200
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "--- %d files matching '%s' (newest first) ---\n", len(results), pattern)
-	for i, r := range results {
-		if i >= limit {
-			fmt.Fprintf(&b, "... and %d more files\n", len(results)-limit)
+	var b lineBudget
+	b.add(fmt.Sprintf("--- %d files matching '%s' (newest first) ---", len(results), pattern))
+	shown := 0
+	for _, r := range results {
+		if shown >= limit {
 			break
 		}
-		fmt.Fprintf(&b, "%s (%s, %s)\n", r.rel, fmtSize(r.size),
-			r.mtime.Format("2006-01-02 15:04"))
+		before := len(b.lines)
+		b.add(fmt.Sprintf("%s (%s, %s)", r.rel, fmtSize(r.size), r.mtime.Format("2006-01-02 15:04")))
+		if len(b.lines) == before {
+			break
+		}
+		shown++
 	}
-	return strings.TrimRight(b.String(), "\n")
+	if note := b.omitted(len(results)-shown, "files"); note != "" {
+		return b.String() + "\n" + note
+	}
+	return b.String()
 }
 
 type globResult struct {
@@ -81,14 +79,19 @@ type globResult struct {
 
 func walkGlob(base, pattern string) ([]globResult, error) {
 	normPattern := strings.ReplaceAll(pattern, "\\", "/")
-	pathScoped := strings.Contains(normPattern, "/")
+	// A pattern without a slash may also match by file name alone.
+	byName := !strings.Contains(normPattern, "/")
+	match, err := globRegexp(normPattern)
+	if err != nil {
+		return nil, err
+	}
 	explicit := pattern != "*" && pattern != "*.*" && pattern != ""
 
 	deadline := time.Now().Add(scanTimeout)
 	scanned := 0
 	var results []globResult
 
-	err := filepath.Walk(base, func(p string, info os.FileInfo, err error) error {
+	err = filepath.Walk(base, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -106,29 +109,20 @@ func walkGlob(base, pattern string) ([]globResult, error) {
 			return fmt.Errorf("Error: Too many files (%d+). Narrow your search.", maxFiles)
 		}
 
-		name := info.Name()
-		var matched bool
-		if pathScoped {
-			rel, _ := filepath.Rel(base, p)
-			relPosix := filepath.ToSlash(rel)
-			matched, _ = filepath.Match(normPattern, relPosix)
-			if !matched && !strings.Contains(normPattern, "**") {
-				alt := strings.Replace(normPattern, "/", "/*", 1)
-				matched, _ = filepath.Match(alt, relPosix)
-			}
-		} else {
-			matched, _ = filepath.Match(pattern, name)
+		rel, _ := filepath.Rel(base, p)
+		relPosix := filepath.ToSlash(rel)
+		matched := match.MatchString(relPosix)
+		if !matched && byName {
+			matched = match.MatchString(info.Name())
 		}
 		if !matched {
 			return nil
 		}
-
-		if !explicit && NOISE_EXTS[strings.ToLower(filepath.Ext(name))] {
+		if !explicit && IsBinaryExt(info.Name()) {
 			return nil
 		}
 
-		rel, _ := filepath.Rel(base, p)
-		results = append(results, globResult{rel: filepath.ToSlash(rel), size: info.Size(), mtime: info.ModTime()})
+		results = append(results, globResult{rel: relPosix, size: info.Size(), mtime: info.ModTime()})
 		return nil
 	})
 	if err != nil {
@@ -137,6 +131,94 @@ func walkGlob(base, pattern string) ([]globResult, error) {
 
 	sort.Slice(results, func(i, j int) bool { return results[i].mtime.After(results[j].mtime) })
 	return results, nil
+}
+
+// globMatch reports whether rel, a slash-separated path, matches pattern.
+func globMatch(pattern, rel string) (bool, error) {
+	match, err := globRegexp(strings.ReplaceAll(pattern, "\\", "/"))
+	if err != nil {
+		return false, err
+	}
+	return match.MatchString(rel), nil
+}
+
+// globRegexp compiles a glob to an anchored regexp. It behaves the same on
+// every OS (unlike filepath.Match, whose separator rules differ), and both
+// `*` and `**` may cross directories, which is what small models expect
+// from them: `*.go` finds Go files at any depth, `src/**/*.go` also finds
+// the ones directly under src.
+func globRegexp(pattern string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteString("^")
+	if runtime.GOOS == "windows" {
+		b.WriteString("(?i)")
+	}
+	braceDepth := 0
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch c {
+		case '*':
+			stars := 1
+			for i+1 < len(pattern) && pattern[i+1] == '*' {
+				i++
+				stars++
+			}
+			if stars > 1 && i+1 < len(pattern) && pattern[i+1] == '/' {
+				b.WriteString("(?:.*/)?")
+				i++
+			} else {
+				b.WriteString(".*")
+			}
+		case '?':
+			b.WriteString(".")
+		case '[':
+			j := i + 1
+			if j < len(pattern) && (pattern[j] == '!' || pattern[j] == '^') {
+				j++
+			}
+			if j < len(pattern) && pattern[j] == ']' {
+				j++
+			}
+			for j < len(pattern) && pattern[j] != ']' {
+				j++
+			}
+			if j >= len(pattern) {
+				return nil, fmt.Errorf("Error: Invalid glob '%s': '[' is never closed.", pattern)
+			}
+			class := pattern[i : j+1]
+			if class[1] == '!' {
+				class = "[^" + class[2:]
+			}
+			b.WriteString(class)
+			i = j
+		case '{':
+			braceDepth++
+			b.WriteString("(?:")
+		case '}':
+			if braceDepth == 0 {
+				b.WriteString("}")
+				continue
+			}
+			braceDepth--
+			b.WriteString(")")
+		case ',':
+			if braceDepth > 0 {
+				b.WriteString("|")
+			} else {
+				b.WriteString(",")
+			}
+		default:
+			if strings.IndexByte("\\.+()|^$", c) >= 0 {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(c)
+		}
+	}
+	if braceDepth > 0 {
+		b.WriteString(")")
+	}
+	b.WriteString("$")
+	return regexp.Compile(b.String())
 }
 
 // SuggestFiles finds workspace files whose name matches a target basename,
@@ -172,7 +254,7 @@ func SuggestFiles(workspace, target string, maxResults int) []string {
 		rel = filepath.ToSlash(rel)
 		if low == target {
 			exact = append(exact, rel)
-		} else if strings.Contains(low, target) && !NOISE_EXTS[strings.ToLower(filepath.Ext(info.Name()))] {
+		} else if strings.Contains(low, target) && !IsBinaryExt(info.Name()) {
 			contains = append(contains, rel)
 		}
 		return nil
@@ -187,8 +269,8 @@ func SuggestFiles(workspace, target string, maxResults int) []string {
 	return merged
 }
 
-// resolveUnder resolves an absolute or workspace-relative path strictly under
-// the workspace. Returns "" when the input is unusable.
+// resolveUnder resolves an absolute or workspace-relative path, returning ""
+// when it is unusable or points outside the workspace.
 func resolveUnder(workspace, p string) string {
 	if p == "" {
 		p = "."
@@ -196,7 +278,29 @@ func resolveUnder(workspace, p string) string {
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(workspace, p)
 	}
-	return filepath.Clean(p)
+	p = filepath.Clean(p)
+	if workspace == "" {
+		return p
+	}
+	if abs, err := filepath.Abs(workspace); err == nil {
+		workspace = abs
+	}
+	if !insideWorkspace(workspace, p) {
+		return ""
+	}
+	return p
+}
+
+func insideWorkspace(ws, p string) bool {
+	rel, err := filepath.Rel(ws, p)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func outsideWorkspaceError(path string) string {
+	return fmt.Sprintf("Error: '%s' is outside the project directory. Use a bare relative name like calc.py instead.", path)
 }
 
 func fmtSize(size int64) string {

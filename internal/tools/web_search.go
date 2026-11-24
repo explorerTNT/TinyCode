@@ -2,6 +2,7 @@ package tools
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,6 +12,9 @@ import (
 )
 
 const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+// maxSearchPageBytes is how much of a results page is parsed.
+const maxSearchPageBytes = 2 << 20
 
 // WebSearch searches DuckDuckGo's HTML endpoint and returns up to maxResults.
 func WebSearch(query string, maxResults int) string {
@@ -37,73 +41,20 @@ func WebSearch(query string, maxResults int) string {
 		return fmt.Sprintf("Error searching web: %v", err)
 	}
 	defer resp.Body.Close()
+	// 202 is the anti-bot challenge page; its body is not results.
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusForbidden {
+			return fmt.Sprintf("Error: the search engine blocked the request (HTTP %d, anti-bot check). Wait a minute, or fetch a known URL with web_fetch.", resp.StatusCode)
+		}
 		return fmt.Sprintf("Error searching web: HTTP %d", resp.StatusCode)
 	}
 
-	type result struct {
-		title, snippet, href string
-	}
-	var results []result
-
-	z := html.NewTokenizer(resp.Body)
-	var title, snippet, link string
-	inSnippet := false
-	snippetDepth := 0
-	for {
-		tt := z.Next()
-		if tt == html.ErrorToken {
-			break
-		}
-		switch tt {
-		case html.StartTagToken, html.SelfClosingTagToken:
-			tok := z.Token()
-			for _, a := range tok.Attr {
-				if a.Key != "class" {
-					continue
-				}
-				if strings.Contains(a.Val, "result__a") {
-					for _, h := range tok.Attr {
-						if h.Key == "href" {
-							link = decodeUDDG(h.Val)
-						}
-					}
-				} else if strings.Contains(a.Val, "result__snippet") {
-					inSnippet = true
-					snippetDepth = 1
-				}
-			}
-		case html.TextToken:
-			text := strings.TrimSpace(html.UnescapeString(string(z.Text())))
-			if text == "" {
-				continue
-			}
-			if inSnippet {
-				if snippet == "" {
-					snippet = text
-				} else {
-					snippet += " " + text
-				}
-			} else if title == "" {
-				title = text
-			}
-		case html.EndTagToken:
-			if inSnippet {
-				snippetDepth--
-				if snippetDepth <= 0 {
-					inSnippet = false
-					results = append(results, result{title: title, snippet: snippet, href: link})
-					title, snippet, link = "", "", ""
-				}
-			}
-		}
-		if len(results) >= maxResults {
-			break
-		}
-	}
-
+	results := parseSearchResults(io.LimitReader(resp.Body, maxSearchPageBytes))
 	if len(results) == 0 {
 		return fmt.Sprintf("No results for '%s'", query)
+	}
+	if len(results) > maxResults {
+		results = results[:maxResults]
 	}
 
 	var b strings.Builder
@@ -111,11 +62,104 @@ func WebSearch(query string, maxResults int) string {
 	for i, r := range results {
 		snippet := cleanWS(r.snippet)
 		if len(snippet) > 300 {
-			snippet = snippet[:300]
+			snippet = truncateRunes(snippet, 300)
 		}
 		fmt.Fprintf(&b, "\n\n%d. %s\n   %s\n   %s", i+1, r.title, snippet, r.href)
 	}
 	return b.String()
+}
+
+type searchResult struct {
+	title, snippet, href string
+}
+
+// parseSearchResults reads the result links and snippets of a DuckDuckGo
+// HTML page. Text is taken only from inside those two elements, and an
+// element ends when its own closing tag comes: nested tags such as the
+// <b> around matched terms must not cut a snippet short.
+func parseSearchResults(r io.Reader) []searchResult {
+	const (
+		outside = iota
+		inTitle
+		inSnippet
+	)
+	var (
+		results []searchResult
+		cur     searchResult
+		buf     strings.Builder
+		zone    = outside
+		depth   int
+	)
+	close := func() {
+		switch zone {
+		case inTitle:
+			cur.title = cleanWS(buf.String())
+		case inSnippet:
+			cur.snippet = cleanWS(buf.String())
+			results = append(results, cur)
+			cur = searchResult{}
+		}
+		buf.Reset()
+		zone = outside
+	}
+
+	z := html.NewTokenizer(r)
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			close()
+			// The last result may have had no snippet.
+			if cur.title != "" || cur.href != "" {
+				results = append(results, cur)
+			}
+			return results
+		}
+		switch tt {
+		case html.StartTagToken, html.SelfClosingTagToken:
+			tok := z.Token()
+			if zone == outside {
+				class := tokenAttr(tok, "class")
+				switch {
+				case strings.Contains(class, "result__a"):
+					// A result is complete once its snippet closes; one
+					// without a snippet ends when the next result starts.
+					if cur.title != "" || cur.href != "" {
+						results = append(results, cur)
+					}
+					zone, depth = inTitle, 0
+					cur = searchResult{href: decodeUDDG(tokenAttr(tok, "href"))}
+				case strings.Contains(class, "result__snippet"):
+					zone, depth = inSnippet, 0
+				default:
+					continue
+				}
+				buf.Reset()
+			}
+			if tt == html.StartTagToken && !voidTags[strings.ToLower(tok.Data)] {
+				depth++
+			}
+		case html.EndTagToken:
+			if zone != outside {
+				depth--
+				if depth <= 0 {
+					close()
+				}
+			}
+		case html.TextToken:
+			if zone != outside {
+				buf.WriteString(html.UnescapeString(string(z.Text())))
+			}
+		}
+	}
+}
+
+func tokenAttr(tok html.Token, key string) string {
+	for _, a := range tok.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
 }
 
 func decodeUDDG(href string) string {
